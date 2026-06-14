@@ -1,0 +1,45 @@
+# Node / frontend dependencies
+node_modules/
+
+# Python caches and virtual environments
+__pycache__/
+venv/
+*.pyc
+.venv/
+myenv_backend-py/
+ML_Code_ISL/myevn_streamlit/
+
+# Environment files
+.env
+.env.*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Generated / build output
+dist/
+build/
+out/
+
+# Office documents and presentations
+*.pptx
+*.docx
+
+# Root workspace noise
+__MACOSX/
+
+# Generated media and runtime artifacts
+output.mp3
+saved_videos/
+processed_landmarks.parquet
+Ml/output.mp3
+Ml/processed_landmarks.parquet
+Ml/saved_videos/
+Ml/ML_Code_ISL/captured.parquet
+Ml/ML_Code_ISL/captured copy.parquet
+Ml/ML_Code_ISL/shammers.parquet
+Ml/ML_Code_ISL/predicted_sign.mp3
+ISLRv6 - Copy/ISLRv6/output.mp3
+ISLRv6 - Copy/ISLRv6/output_*.mp3
+ISLRv6 - Copy/ISLRv6/public/TechStackVideos/
