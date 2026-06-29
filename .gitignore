@@ -12,6 +12,8 @@ ML_Code_ISL/myevn_streamlit/
 # Environment files
 .env
 .env.*
+!.env.example
+!ISLRv6/.env.example
 
 # OS files
 .DS_Store

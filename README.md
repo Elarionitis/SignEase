@@ -30,6 +30,13 @@ npm run dev
 
 Open `http://localhost:3000`.
 
+For local development, the frontend defaults to `http://localhost:5000`.
+For deployment, set this in Vercel after your backend is deployed:
+
+```bash
+NEXT_PUBLIC_API_BASE_URL=https://your-backend-url
+```
+
 ### Backend
 
 ```bash

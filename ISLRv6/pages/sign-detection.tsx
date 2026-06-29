@@ -136,6 +136,9 @@ export { Alert, AlertContent, AlertDescription, AlertTitle };
 
 const pacifico = { className: "font-serif", variable: "font-serif" };
 const inter = { variable: "font-sans" };
+const API_BASE_URL =
+  process.env.NEXT_PUBLIC_API_BASE_URL?.replace(/\/$/, "") ||
+  "http://localhost:5000";
 
 // Add elegant shapes for visual consistency with home page
 function ElegantShape({
@@ -519,7 +522,7 @@ const SignDetection: React.FC<SignDetectionProps> = React.memo(() => {
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), 30000);
 
-      const response = await fetch("http://localhost:5000/predict", {
+      const response = await fetch(`${API_BASE_URL}/predict`, {
         method: "POST",
         body: formData,
         signal: controller.signal,
@@ -544,7 +547,7 @@ const SignDetection: React.FC<SignDetectionProps> = React.memo(() => {
 
         if (responseData.audio_url) {
           const audio = new Audio(
-            `http://localhost:5000${responseData.audio_url}?t=${Date.now()}`
+            `${API_BASE_URL}${responseData.audio_url}?t=${Date.now()}`
           );
           void audio.play().catch(console.error);
         }
