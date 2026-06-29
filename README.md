@@ -43,11 +43,19 @@ NEXT_PUBLIC_API_BASE_URL=https://your-backend-url
 cd Ml
 python -m venv .venv
 source .venv/bin/activate
-pip install flask flask-cors opencv-python mediapipe pandas numpy tensorflow gtts pyarrow
+pip install -r requirements.txt
 python backend.py
 ```
 
 The frontend expects the backend on `http://localhost:5000`.
+
+For Render, use these settings:
+
+```txt
+Root Directory: Ml
+Build Command: pip install -r requirements.txt
+Start Command: gunicorn backend:app --bind 0.0.0.0:$PORT --timeout 120
+```
 
 ## ML Model Notes
 
