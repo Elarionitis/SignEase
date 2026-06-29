@@ -57,6 +57,8 @@ Build Command: pip install -r requirements.txt
 Start Command: gunicorn backend:app --bind 0.0.0.0:$PORT --timeout 120
 ```
 
+The backend pins Python in `Ml/runtime.txt` so Render installs TensorFlow and MediaPipe with a compatible Python version.
+
 ## ML Model Notes
 
 The ML code is based on isolated ASL recognition using the Google ASL Signs dataset and a custom GISLR dataset:
