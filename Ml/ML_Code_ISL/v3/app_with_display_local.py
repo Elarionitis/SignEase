@@ -1,5 +1,5 @@
 #venv path ~/PythonVenv/ISLRv2git/bin/python3.12
-#Coded by Pavan Chauhan!
+#Coded by Suhan Ramani!
 import streamlit as st
 import cv2
 import mediapipe as mp

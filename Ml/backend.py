@@ -1,41 +1,54 @@
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
-import cv2
-import mediapipe as mp
-import pandas as pd
-import tensorflow.lite as tflite
-import numpy as np
 import os
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+os.environ.setdefault("MPLCONFIGDIR", os.path.join(BASE_DIR, ".cache", "matplotlib"))
+os.environ.setdefault("XDG_CACHE_HOME", os.path.join(BASE_DIR, ".cache"))
+os.makedirs(os.environ["MPLCONFIGDIR"], exist_ok=True)
+
+import pandas as pd
+import numpy as np
 import threading
-import time
 import random
 from gtts import gTTS
 
 app = Flask(__name__)
 CORS(app)
 
-UPLOAD_FOLDER = "saved_videos"
+ML_DIR = os.path.join(BASE_DIR, "ML_Code_ISL")
+
+UPLOAD_FOLDER = os.path.join(BASE_DIR, "saved_videos")
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-# Initialize MediaPipe Holistic Model
-mp_holistic = mp.solutions.holistic
+dummy_parquet_skel_file = os.path.join(ML_DIR, "data", "239181.parquet")
+tflite_model = os.path.join(ML_DIR, "models", "asl_model.tflite")
+csv_file = os.path.join(ML_DIR, "data", "train.csv")
+captured_parquet_file = os.path.join(ML_DIR, "captured.parquet")
 
-# File paths (Ensure these are correctly set up on your system)
-dummy_parquet_skel_file = './ML_Code_ISL/data/239181.parquet'
-tflite_model = './Ml_Code_ISL/models/asl_model.tflite'
-csv_file = './Ml_Code_ISL/data/train.csv'
-captured_parquet_file = './Ml_Code_ISL/shammers.parquet'
+xyz = None
+prediction_fn = None
+ORD2SIGN = None
+mp_holistic = None
 
-# Load Skeleton Structure & Model
-xyz = pd.read_parquet(dummy_parquet_skel_file)
-interpreter = tflite.Interpreter(tflite_model)
-prediction_fn = interpreter.get_signature_runner("serving_default")
 
-# Load Sign Label Mappings
-train = pd.read_csv(csv_file)
-train['sign_ord'] = train['sign'].astype('category').cat.codes
-SIGN2ORD = train[['sign', 'sign_ord']].set_index('sign').squeeze().to_dict()
-ORD2SIGN = train[['sign_ord', 'sign']].set_index('sign_ord').squeeze().to_dict()
+def load_ml_resources():
+    global xyz, prediction_fn, ORD2SIGN, mp_holistic
+
+    if prediction_fn is not None:
+        return
+
+    import mediapipe as mp
+    import tensorflow.lite as tflite
+
+    mp_holistic = mp.solutions.holistic
+    xyz = pd.read_parquet(dummy_parquet_skel_file)
+    interpreter = tflite.Interpreter(tflite_model)
+    prediction_fn = interpreter.get_signature_runner("serving_default")
+
+    train = pd.read_csv(csv_file)
+    train["sign_ord"] = train["sign"].astype("category").cat.codes
+    ORD2SIGN = train[["sign_ord", "sign"]].set_index("sign_ord").squeeze().to_dict()
 
 
 def create_frame_landmark_df(results, frame, xyz):
@@ -57,6 +70,9 @@ def create_frame_landmark_df(results, frame, xyz):
 
 def process_video(video_path):
     """Processes the uploaded video, extracts landmarks, and saves them in Parquet format."""
+    import cv2
+
+    load_ml_resources()
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         return None  # Ensure the file is readable
@@ -126,6 +142,8 @@ def get_prediction(prediction_fn, pq_file):
 @app.route("/predict", methods=["POST"])
 def predict():
     """Handles video upload, processing, prediction, and generates speech output."""
+    load_ml_resources()
+
     if "video" not in request.files:
         return jsonify({"error": "No video uploaded"}), 400
 
@@ -167,6 +185,11 @@ def predict():
 def get_audio():
     """Serves the generated audio file for sign language translation."""
     return send_file("output.mp3", mimetype="audio/mpeg")
+
+
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok"})
 
 
 if __name__ == "__main__":

@@ -1,5 +1,5 @@
 #venv path ~/PythonVenv/ISLRv2_3.11/bin/python3.11
-#Coded by Pavan Chauhan!
+#Coded by Suhan Ramani!
 import streamlit as st
 import cv2
 import mediapipe as mp
@@ -169,10 +169,10 @@ def animate_sign_video(sign):
     return animation.to_html5_video()
 
 if __name__ == "__main__":
-    dummy_parquet_skel_file = '/Users/pavan/ISLRv2/data/239181.parquet'
-    tflite_model = '/Users/pavan/ISLRv2/models/asl_model.tflite'
-    csv_file = '/Users/pavan/ISLRv2/data/train.csv'
-    captured_parquet_file = '/Users/pavan/ISLRv2/shammers.parquet'
+    dummy_parquet_skel_file = '/Users/Suhan/ISLRv2/data/239181.parquet'
+    tflite_model = '/Users/Suhan/ISLRv2/models/asl_model.tflite'
+    csv_file = '/Users/Suhan/ISLRv2/data/train.csv'
+    captured_parquet_file = '/Users/Suhan/ISLRv2/shammers.parquet'
     xyz = pd.read_parquet(dummy_parquet_skel_file)
     # Combine main script and inference code
     interpreter = tflite.Interpreter(tflite_model)

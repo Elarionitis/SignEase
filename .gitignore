@@ -18,6 +18,7 @@ ML_Code_ISL/myevn_streamlit/
 Thumbs.db
 
 # Generated / build output
+.next/
 dist/
 build/
 out/
@@ -42,4 +43,6 @@ Ml/ML_Code_ISL/shammers.parquet
 Ml/ML_Code_ISL/predicted_sign.mp3
 ISLRv6 - Copy/ISLRv6/output.mp3
 ISLRv6 - Copy/ISLRv6/output_*.mp3
-ISLRv6 - Copy/ISLRv6/public/TechStackVideos/
+ISLRv6 - Copy/ISLRv6/public/TechStackVideos/Ml/env/
+Ml/.cache/
+Ml/env/
