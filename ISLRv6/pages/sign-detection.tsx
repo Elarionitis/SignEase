@@ -282,6 +282,21 @@ const SignDetection: React.FC<SignDetectionProps> = React.memo(() => {
   }, []);
 
   // Welcome speech function with improved debugging and reliability
+  const getPreferredVoice = useCallback(() => {
+    const voices = speechSynthesisRef.current?.getVoices() || [];
+    const englishVoices = voices.filter(
+      (voice) => voice.lang.includes("en") || voice.name.includes("English")
+    );
+    const femaleVoice = englishVoices.find(
+      (voice) =>
+        voice.name.includes("Female") ||
+        voice.name.includes("woman") ||
+        voice.name.includes("Girl")
+    );
+
+    return femaleVoice || englishVoices[0] || voices[0] || null;
+  }, []);
+
   const speakWelcomeMessage = useCallback(() => {
     // Don't try to speak if we've already done it or if speech synthesis isn't available
     if (hasPlayedWelcome || !speechSynthesisRef.current || !('speechSynthesis' in window)) {
@@ -309,27 +324,9 @@ const SignDetection: React.FC<SignDetectionProps> = React.memo(() => {
       welcomeMessage.pitch = 1.0; // Normal pitch
       welcomeMessage.volume = 1.0; // Full volume
       
-      // Get available voices and select a good English voice if available
-      const voices = speechSynthesisRef.current.getVoices();
-      console.log(`Available voices: ${voices.length}`);
-      
-      if (voices.length > 0) {
-        // Filter for English voices
-        const englishVoices = voices.filter(voice => 
-          voice.lang.includes('en') || voice.name.includes('English')
-        );
-        console.log(`English voices: ${englishVoices.length}`);
-        
-        if (englishVoices.length > 0) {
-          // Prefer a female voice if available
-          const femaleVoice = englishVoices.find(voice => 
-            voice.name.includes('Female') || 
-            voice.name.includes('woman') || 
-            voice.name.includes('Girl')
-          );
-          welcomeMessage.voice = femaleVoice || englishVoices[0];
-          console.log(`Selected voice: ${welcomeMessage.voice?.name || 'Default'}`);
-        }
+      const preferredVoice = getPreferredVoice();
+      if (preferredVoice) {
+        welcomeMessage.voice = preferredVoice;
       }
       
       // Event handlers for speech
@@ -383,7 +380,7 @@ const SignDetection: React.FC<SignDetectionProps> = React.memo(() => {
       // Only log internally, don't show to user
       setDebugMessageInternal(`Speech initialization error`);
     }
-  }, [hasPlayedWelcome]);
+  }, [getPreferredVoice, hasPlayedWelcome]);
 
   const speakPrediction = useCallback((sign: string) => {
     if (
@@ -403,12 +400,9 @@ const SignDetection: React.FC<SignDetectionProps> = React.memo(() => {
       utterance.pitch = 1;
       utterance.volume = 1;
 
-      const voices = speechSynthesisRef.current.getVoices();
-      const englishVoice = voices.find(
-        (voice) => voice.lang.includes("en") || voice.name.includes("English")
-      );
-      if (englishVoice) {
-        utterance.voice = englishVoice;
+      const preferredVoice = getPreferredVoice();
+      if (preferredVoice) {
+        utterance.voice = preferredVoice;
       }
 
       utterance.onstart = () => setIsSpeaking(true);
@@ -420,7 +414,7 @@ const SignDetection: React.FC<SignDetectionProps> = React.memo(() => {
       console.error("Prediction speech error:", error);
       setIsSpeaking(false);
     }
-  }, []);
+  }, [getPreferredVoice]);
 
   // Try to speak welcome message when voices are loaded and component is mounted
   useEffect(() => {
