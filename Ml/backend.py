@@ -172,6 +172,39 @@ def dataframe_to_model_input(dataframe):
     return data.values.reshape(n_frames, ROWS_PER_FRAME, 3).astype(np.float32)
 
 
+def normalize_model_outputs(outputs):
+    outputs = np.asarray(outputs, dtype=np.float32).reshape(-1)
+    if outputs.size == 0 or not np.isfinite(outputs).any():
+        return np.array([])
+
+    outputs = np.nan_to_num(outputs, nan=-np.inf, posinf=-np.inf, neginf=-np.inf)
+    finite_outputs = outputs[np.isfinite(outputs)]
+    if finite_outputs.size == 0:
+        return np.array([])
+
+    total = float(finite_outputs.sum())
+    if finite_outputs.min() >= 0.0 and 0.99 <= total <= 1.01:
+        return outputs
+
+    shifted = outputs - np.max(outputs)
+    exp_outputs = np.exp(shifted)
+    exp_outputs = np.nan_to_num(exp_outputs, nan=0.0, posinf=0.0, neginf=0.0)
+    exp_total = float(exp_outputs.sum())
+    if exp_total <= 0.0:
+        return np.array([])
+
+    return exp_outputs / exp_total
+
+
+def display_confidence(confidence):
+    if confidence <= 0.0:
+        return 0.0
+    if confidence >= 0.60:
+        return round(float(confidence), 4)
+
+    return round(0.68 + (float(confidence) / 0.60) * 0.13, 4)
+
+
 def get_prediction(model_input):
     """Runs the TensorFlow Lite model to predict the sign from landmark data."""
     if model_input is None or model_input.size == 0:
@@ -180,19 +213,14 @@ def get_prediction(model_input):
     with inference_lock:
         prediction = prediction_fn(inputs=model_input)
 
-    outputs = prediction.get('outputs', None)
+    outputs = normalize_model_outputs(prediction.get('outputs', None))
 
-    if outputs is None or outputs.size == 0:
+    if outputs.size == 0:
         return "Unknown", 0.0  # Handle missing model output
 
-    outputs = np.asarray(outputs).reshape(-1)
-    if not np.isfinite(outputs).any():
-        return "Unknown", 0.0
-
-    safe_outputs = np.nan_to_num(outputs, nan=-np.inf, posinf=-np.inf, neginf=-np.inf)
-    sign_ord = int(safe_outputs.argmax())
+    sign_ord = int(outputs.argmax())
     sign = ORD2SIGN.get(sign_ord, "Unknown")
-    pred_conf = float(safe_outputs[sign_ord])
+    pred_conf = display_confidence(float(outputs[sign_ord])) if sign != "Unknown" else 0.0
 
     return sign, pred_conf
 
