@@ -41,6 +41,12 @@ def load_ml_resources():
     import mediapipe as mp
     import tensorflow.lite as tflite
 
+    if not hasattr(mp, "solutions"):
+        raise RuntimeError(
+            "Installed mediapipe package does not include the legacy solutions "
+            "API required by this backend. Use mediapipe==0.10.11."
+        )
+
     mp_holistic = mp.solutions.holistic
     xyz = pd.read_parquet(dummy_parquet_skel_file)
     interpreter = tflite.Interpreter(tflite_model)
