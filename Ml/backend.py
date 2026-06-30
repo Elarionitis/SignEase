@@ -31,6 +31,9 @@ prediction_fn = None
 ORD2SIGN = None
 mp_holistic = None
 
+FRAME_SAMPLE_RATE = 5
+MAX_FRAME_WIDTH = 640
+
 
 def load_ml_resources():
     global xyz, prediction_fn, ORD2SIGN, mp_holistic
@@ -57,9 +60,8 @@ def load_ml_resources():
     ORD2SIGN = train[["sign_ord", "sign"]].set_index("sign_ord").squeeze().to_dict()
 
 
-def create_frame_landmark_df(results, frame, xyz):
+def create_frame_landmark_df(results, frame, xyz_skel):
     """Extracts and formats landmark data for a given frame."""
-    xyz_skel = xyz[['type', 'landmark_index']].drop_duplicates().reset_index(drop=True)
     data = []
 
     for landmark_type, landmark_data in zip(
@@ -85,16 +87,27 @@ def process_video(video_path):
 
     frame = 0
     all_landmarks = []
+    xyz_skel = xyz[['type', 'landmark_index']].drop_duplicates().reset_index(drop=True)
+
     with mp_holistic.Holistic(min_detection_confidence=0.5, min_tracking_confidence=0.5) as holistic:
         while cap.isOpened():
             success, image = cap.read()
             if not success:
                 break
 
-            if frame % 3 == 0:  # Process every third frame for efficiency
+            if frame % FRAME_SAMPLE_RATE == 0:
+                height, width = image.shape[:2]
+                if width > MAX_FRAME_WIDTH:
+                    scale = MAX_FRAME_WIDTH / width
+                    image = cv2.resize(
+                        image,
+                        (MAX_FRAME_WIDTH, int(height * scale)),
+                        interpolation=cv2.INTER_AREA,
+                    )
+
                 image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
                 results = holistic.process(image)
-                all_landmarks.append(create_frame_landmark_df(results, frame, xyz))
+                all_landmarks.append(create_frame_landmark_df(results, frame, xyz_skel))
 
             frame += 1
 

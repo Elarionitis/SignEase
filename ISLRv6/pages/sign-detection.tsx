@@ -139,6 +139,8 @@ const inter = { variable: "font-sans" };
 const API_BASE_URL =
   process.env.NEXT_PUBLIC_API_BASE_URL?.replace(/\/$/, "") ||
   "http://localhost:5000";
+const PREDICTION_TIMEOUT_MS = 180000;
+const MAX_RECORDING_DURATION = 10;
 
 // Add elegant shapes for visual consistency with home page
 function ElegantShape({
@@ -466,6 +468,7 @@ const SignDetection: React.FC<SignDetectionProps> = React.memo(() => {
           videoElement.srcObject as MediaStream,
           {
             mimeType: "video/webm;codecs=vp9",
+            videoBitsPerSecond: 600000,
           }
         );
 
@@ -520,42 +523,60 @@ const SignDetection: React.FC<SignDetectionProps> = React.memo(() => {
       formData.append("video", videoBlob, `sign_${Date.now()}.webm`);
 
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 30000);
+      const timeoutId = setTimeout(
+        () => controller.abort(),
+        PREDICTION_TIMEOUT_MS
+      );
 
-      const response = await fetch(`${API_BASE_URL}/predict`, {
-        method: "POST",
-        body: formData,
-        signal: controller.signal,
-        headers: {
-          Accept: "application/json",
-        },
-      });
+      try {
+        const response = await fetch(`${API_BASE_URL}/predict`, {
+          method: "POST",
+          body: formData,
+          signal: controller.signal,
+          headers: {
+            Accept: "application/json",
+          },
+        });
 
-      clearTimeout(timeoutId);
+        const responseText = await response.text();
+        const responseData = responseText ? JSON.parse(responseText) : {};
 
-      const responseData = await response.json();
-
-      // Batch state updates
-      React.startTransition(() => {
-        setPrediction(responseData.sign || "No sign detected");
-        setConfidence(
-          responseData.confidence ? responseData.confidence * 100 : 0
-        );
-        setTimer(0);
-        setIsDetecting(false);
-        setCapturing(false);
-
-        if (responseData.audio_url) {
-          const audio = new Audio(
-            `${API_BASE_URL}${responseData.audio_url}?t=${Date.now()}`
+        if (!response.ok) {
+          throw new Error(
+            responseData.error || `Prediction failed (${response.status})`
           );
-          void audio.play().catch(console.error);
         }
-      });
+
+        // Batch state updates
+        React.startTransition(() => {
+          setPrediction(responseData.sign || "No sign detected");
+          setConfidence(
+            responseData.confidence ? responseData.confidence * 100 : 0
+          );
+          setTimer(0);
+          setIsDetecting(false);
+          setCapturing(false);
+
+          if (responseData.audio_url) {
+            const audio = new Audio(
+              `${API_BASE_URL}${responseData.audio_url}?t=${Date.now()}`
+            );
+            void audio.play().catch(console.error);
+          }
+        });
+      } finally {
+        clearTimeout(timeoutId);
+      }
     } catch (error: unknown) {
       console.error("Error:", error);
       setPrediction(
-        error instanceof Error ? error.message : "Error processing video"
+        error instanceof Error && error.name === "AbortError"
+          ? "Prediction timed out. Please try again."
+          : error instanceof SyntaxError
+            ? "Server returned an invalid response. Please try again."
+            : error instanceof Error
+              ? error.message
+              : "Error processing video"
       );
       setConfidence(0);
     } finally {
@@ -1058,7 +1079,7 @@ const SignDetection: React.FC<SignDetectionProps> = React.memo(() => {
                             <Slider
                               value={[duration]}
                               onValueChange={(value) => setDuration(value[0])}
-                              max={10}
+                              max={MAX_RECORDING_DURATION}
                               min={1}
                               step={1}
                               disabled={capturing}
