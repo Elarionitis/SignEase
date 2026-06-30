@@ -468,7 +468,6 @@ const SignDetection: React.FC<SignDetectionProps> = React.memo(() => {
           videoElement.srcObject as MediaStream,
           {
             mimeType: "video/webm;codecs=vp9",
-            videoBitsPerSecond: 600000,
           }
         );
 
@@ -547,6 +546,10 @@ const SignDetection: React.FC<SignDetectionProps> = React.memo(() => {
           );
         }
 
+        if (responseData.timing) {
+          console.info("Prediction timing:", responseData.timing);
+        }
+
         // Batch state updates
         React.startTransition(() => {
           setPrediction(responseData.sign || "No sign detected");
@@ -574,6 +577,8 @@ const SignDetection: React.FC<SignDetectionProps> = React.memo(() => {
           ? "Prediction timed out. Please try again."
           : error instanceof SyntaxError
             ? "Server returned an invalid response. Please try again."
+            : error instanceof TypeError
+              ? "Could not reach the prediction server. Check if the Render backend is running."
             : error instanceof Error
               ? error.message
               : "Error processing video"

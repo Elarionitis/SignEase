@@ -1,6 +1,7 @@
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 import os
+import time
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 os.environ.setdefault("MPLCONFIGDIR", os.path.join(BASE_DIR, ".cache", "matplotlib"))
@@ -9,12 +10,12 @@ os.makedirs(os.environ["MPLCONFIGDIR"], exist_ok=True)
 
 import pandas as pd
 import numpy as np
-import threading
 import random
 from gtts import gTTS
+from werkzeug.exceptions import HTTPException
 
 app = Flask(__name__)
-CORS(app)
+CORS(app, resources={r"/*": {"origins": "*"}})
 
 ML_DIR = os.path.join(BASE_DIR, "ML_Code_ISL")
 
@@ -25,14 +26,24 @@ dummy_parquet_skel_file = os.path.join(ML_DIR, "data", "239181.parquet")
 tflite_model = os.path.join(ML_DIR, "models", "asl_model.tflite")
 csv_file = os.path.join(ML_DIR, "data", "train.csv")
 captured_parquet_file = os.path.join(ML_DIR, "captured.parquet")
+audio_path = os.path.join(BASE_DIR, "output.mp3")
+ENABLE_TTS = os.environ.get("ENABLE_TTS", "false").lower() == "true"
 
 xyz = None
 prediction_fn = None
 ORD2SIGN = None
 mp_holistic = None
 
-FRAME_SAMPLE_RATE = 5
-MAX_FRAME_WIDTH = 640
+FRAME_SAMPLE_RATE = 3
+
+
+@app.errorhandler(Exception)
+def handle_exception(error):
+    if isinstance(error, HTTPException):
+        return jsonify({"error": error.description}), error.code
+
+    app.logger.exception("Unhandled backend error")
+    return jsonify({"error": str(error)}), 500
 
 
 def load_ml_resources():
@@ -60,8 +71,9 @@ def load_ml_resources():
     ORD2SIGN = train[["sign_ord", "sign"]].set_index("sign_ord").squeeze().to_dict()
 
 
-def create_frame_landmark_df(results, frame, xyz_skel):
+def create_frame_landmark_df(results, frame, xyz):
     """Extracts and formats landmark data for a given frame."""
+    xyz_skel = xyz[['type', 'landmark_index']].drop_duplicates().reset_index(drop=True)
     data = []
 
     for landmark_type, landmark_data in zip(
@@ -87,7 +99,6 @@ def process_video(video_path):
 
     frame = 0
     all_landmarks = []
-    xyz_skel = xyz[['type', 'landmark_index']].drop_duplicates().reset_index(drop=True)
 
     with mp_holistic.Holistic(min_detection_confidence=0.5, min_tracking_confidence=0.5) as holistic:
         while cap.isOpened():
@@ -96,18 +107,9 @@ def process_video(video_path):
                 break
 
             if frame % FRAME_SAMPLE_RATE == 0:
-                height, width = image.shape[:2]
-                if width > MAX_FRAME_WIDTH:
-                    scale = MAX_FRAME_WIDTH / width
-                    image = cv2.resize(
-                        image,
-                        (MAX_FRAME_WIDTH, int(height * scale)),
-                        interpolation=cv2.INTER_AREA,
-                    )
-
                 image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
                 results = holistic.process(image)
-                all_landmarks.append(create_frame_landmark_df(results, frame, xyz_skel))
+                all_landmarks.append(create_frame_landmark_df(results, frame, xyz))
 
             frame += 1
 
@@ -161,7 +163,9 @@ def get_prediction(prediction_fn, pq_file):
 @app.route("/predict", methods=["POST"])
 def predict():
     """Handles video upload, processing, prediction, and generates speech output."""
+    started_at = time.perf_counter()
     load_ml_resources()
+    resources_loaded_at = time.perf_counter()
 
     if "video" not in request.files:
         return jsonify({"error": "No video uploaded"}), 400
@@ -170,40 +174,46 @@ def predict():
     video_path = os.path.join(UPLOAD_FOLDER, "captured_video.mp4")
     file.save(video_path)
     print(f"✅ Video saved at: {video_path}")
+    saved_at = time.perf_counter()
 
-    # Process video in a separate thread for efficiency
-    result_dict = {}
+    pq_file = process_video(video_path)
+    processed_at = time.perf_counter()
 
-    def process_and_predict():
-        pq_file = process_video(video_path)
-        if pq_file:
-            result_dict['sign'], result_dict['confidence'] = get_prediction(prediction_fn, pq_file)
-        else:
-            result_dict['sign'], result_dict['confidence'] = "Unknown", 0.0
+    if pq_file:
+        detected_sign, confidence = get_prediction(prediction_fn, pq_file)
+    else:
+        detected_sign, confidence = "Unknown", 0.0
+    predicted_at = time.perf_counter()
 
-    processing_thread = threading.Thread(target=process_and_predict)
-    processing_thread.start()
-    processing_thread.join()
-
-    detected_sign = result_dict.get('sign', "Unknown")
-    confidence = result_dict.get('confidence', 0.0)
-
-    # Generate Speech Output
-    tts = gTTS(text=detected_sign, lang='en')
-    audio_path = "output.mp3"
-    tts.save(audio_path)
-
-    return jsonify({
+    response = {
         "sign": detected_sign,
         "confidence": confidence,
-        "audio_url": "/audio"
-    })
+        "timing": {
+            "resource_load_seconds": round(resources_loaded_at - started_at, 3),
+            "upload_save_seconds": round(saved_at - resources_loaded_at, 3),
+            "video_processing_seconds": round(processed_at - saved_at, 3),
+            "model_prediction_seconds": round(predicted_at - processed_at, 3),
+            "total_seconds": round(predicted_at - started_at, 3),
+        },
+    }
+
+    app.logger.info("Prediction response: %s", response)
+
+    if ENABLE_TTS:
+        try:
+            tts = gTTS(text=detected_sign, lang='en')
+            tts.save(audio_path)
+            response["audio_url"] = "/audio"
+        except Exception as error:
+            app.logger.warning("TTS generation failed: %s", error)
+
+    return jsonify(response)
 
 
 @app.route("/audio", methods=["GET"])
 def get_audio():
     """Serves the generated audio file for sign language translation."""
-    return send_file("output.mp3", mimetype="audio/mpeg")
+    return send_file(audio_path, mimetype="audio/mpeg")
 
 
 @app.route("/health", methods=["GET"])
