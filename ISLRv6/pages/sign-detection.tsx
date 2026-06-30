@@ -385,6 +385,43 @@ const SignDetection: React.FC<SignDetectionProps> = React.memo(() => {
     }
   }, [hasPlayedWelcome]);
 
+  const speakPrediction = useCallback((sign: string) => {
+    if (
+      !sign ||
+      sign === "Unknown" ||
+      sign === "No sign detected" ||
+      !speechSynthesisRef.current ||
+      !("speechSynthesis" in window)
+    ) {
+      return;
+    }
+
+    try {
+      speechSynthesisRef.current.cancel();
+      const utterance = new SpeechSynthesisUtterance(`Predicted sign is ${sign}`);
+      utterance.rate = 1;
+      utterance.pitch = 1;
+      utterance.volume = 1;
+
+      const voices = speechSynthesisRef.current.getVoices();
+      const englishVoice = voices.find(
+        (voice) => voice.lang.includes("en") || voice.name.includes("English")
+      );
+      if (englishVoice) {
+        utterance.voice = englishVoice;
+      }
+
+      utterance.onstart = () => setIsSpeaking(true);
+      utterance.onend = () => setIsSpeaking(false);
+      utterance.onerror = () => setIsSpeaking(false);
+
+      speechSynthesisRef.current.speak(utterance);
+    } catch (error) {
+      console.error("Prediction speech error:", error);
+      setIsSpeaking(false);
+    }
+  }, []);
+
   // Try to speak welcome message when voices are loaded and component is mounted
   useEffect(() => {
     if (mounted && isClient && voicesLoaded && !hasPlayedWelcome) {
@@ -550,23 +587,20 @@ const SignDetection: React.FC<SignDetectionProps> = React.memo(() => {
           console.info("Prediction timing:", responseData.timing);
         }
 
+        const detectedSign = responseData.sign || "No sign detected";
+
         // Batch state updates
         React.startTransition(() => {
-          setPrediction(responseData.sign || "No sign detected");
+          setPrediction(detectedSign);
           setConfidence(
             responseData.confidence ? responseData.confidence * 100 : 0
           );
           setTimer(0);
           setIsDetecting(false);
           setCapturing(false);
-
-          if (responseData.audio_url) {
-            const audio = new Audio(
-              `${API_BASE_URL}${responseData.audio_url}?t=${Date.now()}`
-            );
-            void audio.play().catch(console.error);
-          }
         });
+
+        speakPrediction(detectedSign);
       } finally {
         clearTimeout(timeoutId);
       }
@@ -589,7 +623,7 @@ const SignDetection: React.FC<SignDetectionProps> = React.memo(() => {
       setIsDetecting(false);
       setCapturing(false);
     }
-  }, []);
+  }, [speakPrediction]);
 
   // Prevent form submission
   const handleStartRecording = React.useCallback(
