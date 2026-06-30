@@ -34,7 +34,6 @@ tflite_model = os.path.join(ML_DIR, "models", "asl_model.tflite")
 csv_file = os.path.join(ML_DIR, "data", "train.csv")
 audio_path = os.path.join(BASE_DIR, "output.mp3")
 ENABLE_TTS = os.environ.get("ENABLE_TTS", "false").lower() == "true"
-PRELOAD_ML = os.environ.get("PRELOAD_ML", "true").lower() == "true"
 
 xyz = None
 interpreter = None
@@ -289,9 +288,5 @@ def health():
     return jsonify({"status": "ok"})
 
 
-if PRELOAD_ML:
-    load_ml_resources()
-
-
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")), debug=False)
