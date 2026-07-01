@@ -31,11 +31,6 @@ npm run dev
 Open `http://localhost:3000`.
 
 For local development, the frontend defaults to `http://localhost:5000`.
-For deployment, set this in Vercel after your backend is deployed:
-
-```bash
-NEXT_PUBLIC_API_BASE_URL=https://your-backend-url
-```
 
 ### Backend
 
@@ -48,16 +43,6 @@ python backend.py
 ```
 
 The frontend expects the backend on `http://localhost:5000`.
-
-For Render, use these settings:
-
-```txt
-Root Directory: Ml
-Build Command: pip install -r requirements.txt
-Start Command: gunicorn backend:app --bind 0.0.0.0:$PORT --timeout 120
-```
-
-The backend pins Python in `Ml/runtime.txt` so Render installs TensorFlow and MediaPipe with a compatible Python version.
 
 ## ML Model Notes
 
