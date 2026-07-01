@@ -45,8 +45,8 @@ inference_lock = threading.Lock()
 holistic_lock = threading.Lock()
 resource_lock = threading.Lock()
 
-FRAME_SAMPLE_RATE = 3
-MAX_SAMPLED_FRAMES = int(os.environ.get("MAX_SAMPLED_FRAMES", "32"))
+FRAME_SAMPLE_RATE = int(os.environ.get("FRAME_SAMPLE_RATE", "6"))
+MAX_SAMPLED_FRAMES = int(os.environ.get("MAX_SAMPLED_FRAMES", "16"))
 ROWS_PER_FRAME = 543
 LANDMARK_LAYOUT = (
     ("face", "face_landmarks", 468),
@@ -148,31 +148,38 @@ def process_video(video_path):
     if not cap.isOpened():
         return None  # Ensure the file is readable
 
-    frame = 0
     all_landmarks = []
     target_frame_indices = get_target_frame_indices(cap)
 
     with holistic_lock:
-        while cap.isOpened():
-            success, image = cap.read()
-            if not success:
-                break
+        if target_frame_indices is not None:
+            for frame_index in sorted(target_frame_indices):
+                if len(all_landmarks) >= MAX_SAMPLED_FRAMES:
+                    break
 
-            should_process = (
-                frame in target_frame_indices
-                if target_frame_indices is not None
-                else frame % FRAME_SAMPLE_RATE == 0
-            )
+                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+                success, image = cap.read()
+                if not success:
+                    continue
 
-            if should_process:
                 image.flags.writeable = False
                 image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
                 results = holistic.process(image)
                 all_landmarks.append(landmarks_to_frame_array(results))
-                if len(all_landmarks) >= MAX_SAMPLED_FRAMES:
+        else:
+            frame = 0
+            while cap.isOpened() and len(all_landmarks) < MAX_SAMPLED_FRAMES:
+                success, image = cap.read()
+                if not success:
                     break
 
-            frame += 1
+                if frame % FRAME_SAMPLE_RATE == 0:
+                    image.flags.writeable = False
+                    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                    results = holistic.process(image)
+                    all_landmarks.append(landmarks_to_frame_array(results))
+
+                frame += 1
 
     cap.release()  # Ensure resources are released
 

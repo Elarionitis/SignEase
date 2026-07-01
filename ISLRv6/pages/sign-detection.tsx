@@ -435,12 +435,12 @@ const SignDetection: React.FC<SignDetectionProps> = React.memo(() => {
     }
   }, [getPreferredVoice]);
 
-  // Browsers block autoplayed speech in production, so keep instructions manual.
+  // Try the intro speech automatically, then fall back to the manual button if blocked.
   useEffect(() => {
     if (mounted && isClient && voicesLoaded && !hasPlayedWelcome) {
-      setSpeechBlocked(true);
+      speakWelcomeMessage();
     }
-  }, [mounted, isClient, voicesLoaded, hasPlayedWelcome]);
+  }, [mounted, isClient, voicesLoaded, hasPlayedWelcome, speakWelcomeMessage]);
 
   // Add a manual interaction handler for browsers that block auto-play audio
   const handleManualSpeech = () => {
