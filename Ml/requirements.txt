@@ -5,6 +5,4 @@ gTTS==2.5.3
 mediapipe==0.10.11
 numpy==1.26.4
 opencv-python-headless==4.10.0.84
-pandas==2.2.3
-pyarrow==17.0.0
 tflite-runtime==2.14.0

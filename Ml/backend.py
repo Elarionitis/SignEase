@@ -1,5 +1,6 @@
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
+import csv
 import os
 import time
 import threading
@@ -16,12 +17,12 @@ os.environ.setdefault("MPLCONFIGDIR", os.path.join(BASE_DIR, ".cache", "matplotl
 os.environ.setdefault("XDG_CACHE_HOME", os.path.join(BASE_DIR, ".cache"))
 os.makedirs(os.environ["MPLCONFIGDIR"], exist_ok=True)
 
-import pandas as pd
 import numpy as np
 from gtts import gTTS
 from werkzeug.exceptions import HTTPException
 
 app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = int(os.environ.get("MAX_UPLOAD_MB", "8")) * 1024 * 1024
 CORS(app, resources={r"/*": {"origins": "*"}})
 
 ML_DIR = os.path.join(BASE_DIR, "ML_Code_ISL")
@@ -35,7 +36,6 @@ csv_file = os.path.join(ML_DIR, "data", "train.csv")
 audio_path = os.path.join(BASE_DIR, "output.mp3")
 ENABLE_TTS = os.environ.get("ENABLE_TTS", "false").lower() == "true"
 
-xyz = None
 interpreter = None
 prediction_fn = None
 ORD2SIGN = None
@@ -46,6 +46,7 @@ holistic_lock = threading.Lock()
 resource_lock = threading.Lock()
 
 FRAME_SAMPLE_RATE = 3
+MAX_SAMPLED_FRAMES = int(os.environ.get("MAX_SAMPLED_FRAMES", "32"))
 ROWS_PER_FRAME = 543
 LANDMARK_LAYOUT = (
     ("face", "face_landmarks", 468),
@@ -53,7 +54,7 @@ LANDMARK_LAYOUT = (
     ("pose", "pose_landmarks", 33),
     ("right_hand", "right_hand_landmarks", 21),
 )
-REQUIRED_FILES = (dummy_parquet_skel_file, tflite_model, csv_file)
+REQUIRED_FILES = (tflite_model, csv_file)
 
 
 @app.errorhandler(Exception)
@@ -66,7 +67,7 @@ def handle_exception(error):
 
 
 def load_ml_resources():
-    global xyz, interpreter, prediction_fn, ORD2SIGN, mp_holistic, holistic
+    global interpreter, prediction_fn, ORD2SIGN, mp_holistic, holistic
 
     if prediction_fn is not None:
         return
@@ -89,26 +90,9 @@ def load_ml_resources():
             raise RuntimeError(
                 "Installed mediapipe package does not include the legacy solutions "
                 "API required by this backend. Use mediapipe==0.10.11."
-            )
+        )
 
         mp_holistic = mp.solutions.holistic
-        xyz = pd.read_parquet(dummy_parquet_skel_file, columns=["type", "landmark_index"])
-
-        required_skel_columns = {"type", "landmark_index"}
-        if not required_skel_columns.issubset(xyz.columns):
-            raise RuntimeError("Skeleton parquet is missing required landmark columns")
-
-        xyz = xyz[["type", "landmark_index"]].drop_duplicates().reset_index(drop=True)
-        if len(xyz) != ROWS_PER_FRAME:
-            raise RuntimeError(f"Skeleton parquet has {len(xyz)} rows; expected {ROWS_PER_FRAME}")
-        expected_order = [
-            (landmark_type, landmark_index)
-            for landmark_type, _, count in LANDMARK_LAYOUT
-            for landmark_index in range(count)
-        ]
-        actual_order = list(xyz.itertuples(index=False, name=None))
-        if actual_order != expected_order:
-            raise RuntimeError("Skeleton parquet landmark order does not match model preprocessing layout")
 
         interpreter = Interpreter(model_path=tflite_model, num_threads=1)
         signature_list = interpreter.get_signature_list()
@@ -121,11 +105,12 @@ def load_ml_resources():
             raise RuntimeError("TFLite serving_default signature is missing the outputs tensor")
         prediction_fn = interpreter.get_signature_runner("serving_default")
 
-        train = pd.read_csv(csv_file)
-        if "sign" not in train.columns:
-            raise RuntimeError("Training CSV is missing the sign column")
-        train["sign_ord"] = train["sign"].astype("category").cat.codes
-        ORD2SIGN = train[["sign_ord", "sign"]].set_index("sign_ord").squeeze().to_dict()
+        with open(csv_file, newline="", encoding="utf-8") as file:
+            reader = csv.DictReader(file)
+            if "sign" not in (reader.fieldnames or []):
+                raise RuntimeError("Training CSV is missing the sign column")
+            signs = {row["sign"] for row in reader if row.get("sign")}
+        ORD2SIGN = {index: sign for index, sign in enumerate(sorted(signs))}
         holistic = mp_holistic.Holistic(min_detection_confidence=0.5, min_tracking_confidence=0.5)
 
 
@@ -145,6 +130,15 @@ def landmarks_to_frame_array(results):
     return frame_landmarks
 
 
+def get_target_frame_indices(cap):
+    total_frames = int(cap.get(7) or 0)
+    if total_frames <= 0:
+        return None
+
+    sampled_count = min(MAX_SAMPLED_FRAMES, max(1, (total_frames + FRAME_SAMPLE_RATE - 1) // FRAME_SAMPLE_RATE))
+    return set(np.linspace(0, total_frames - 1, sampled_count, dtype=np.int32).tolist())
+
+
 def process_video(video_path):
     """Processes the uploaded video and returns model-ready landmark tensors."""
     import cv2
@@ -156,6 +150,7 @@ def process_video(video_path):
 
     frame = 0
     all_landmarks = []
+    target_frame_indices = get_target_frame_indices(cap)
 
     with holistic_lock:
         while cap.isOpened():
@@ -163,11 +158,19 @@ def process_video(video_path):
             if not success:
                 break
 
-            if frame % FRAME_SAMPLE_RATE == 0:
+            should_process = (
+                frame in target_frame_indices
+                if target_frame_indices is not None
+                else frame % FRAME_SAMPLE_RATE == 0
+            )
+
+            if should_process:
                 image.flags.writeable = False
                 image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
                 results = holistic.process(image)
                 all_landmarks.append(landmarks_to_frame_array(results))
+                if len(all_landmarks) >= MAX_SAMPLED_FRAMES:
+                    break
 
             frame += 1
 
@@ -294,7 +297,7 @@ def health():
     return jsonify({"status": "ok"})
 
 
-if os.environ.get("EAGER_LOAD_ML", "true").lower() == "true":
+if os.environ.get("EAGER_LOAD_ML", "false").lower() == "true":
     load_ml_resources()
 
 

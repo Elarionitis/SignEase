@@ -160,6 +160,10 @@ function getSupportedRecordingMimeType() {
   );
 }
 
+function getRecordingExtension(mimeType: string) {
+  return mimeType.includes("mp4") ? "mp4" : "webm";
+}
+
 // Add elegant shapes for visual consistency with home page
 function ElegantShape({
   className,
@@ -315,16 +319,16 @@ const SignDetection: React.FC<SignDetectionProps> = React.memo(() => {
     return femaleVoice || englishVoices[0] || voices[0] || null;
   }, []);
 
-  const speakWelcomeMessage = useCallback(() => {
+  const speakWelcomeMessage = useCallback((force = false) => {
     // Don't try to speak if we've already done it or if speech synthesis isn't available
-    if (hasPlayedWelcome || !speechSynthesisRef.current || !('speechSynthesis' in window)) {
+    if ((!force && hasPlayedWelcome) || !speechSynthesisRef.current || !('speechSynthesis' in window)) {
       return;
     }
 
     try {
       // Check if we already played the welcome message in this session
       const hasPlayed = sessionStorage.getItem('welcomeMessagePlayed');
-      if (hasPlayed) {
+      if (hasPlayed && !force) {
         setHasPlayedWelcome(true);
         return;
       }
@@ -365,8 +369,7 @@ const SignDetection: React.FC<SignDetectionProps> = React.memo(() => {
         sessionStorage.setItem('welcomeMessagePlayed', 'true');
       };
       
-      welcomeMessage.onerror = (event) => {
-        console.error('Speech synthesis error:', event);
+      welcomeMessage.onerror = () => {
         setIsSpeaking(false);
         setHasPlayedWelcome(true);
         setSpeechBlocked(true);
@@ -383,7 +386,6 @@ const SignDetection: React.FC<SignDetectionProps> = React.memo(() => {
       // Set a timeout to check if speech actually started
       setTimeout(() => {
         if (speechSynthesisRef.current && !speechSynthesisRef.current.speaking) {
-          console.warn("Speech didn't start - might be blocked");
           setIsSpeaking(false);
           setSpeechBlocked(true);
           // Only log internally, don't show to user
@@ -392,7 +394,6 @@ const SignDetection: React.FC<SignDetectionProps> = React.memo(() => {
       }, 1000);
       
     } catch (error) {
-      console.error("Error in speech synthesis:", error);
       setIsSpeaking(false);
       setSpeechBlocked(true);
       // Only log internally, don't show to user
@@ -434,25 +435,12 @@ const SignDetection: React.FC<SignDetectionProps> = React.memo(() => {
     }
   }, [getPreferredVoice]);
 
-  // Try to speak welcome message when voices are loaded and component is mounted
+  // Browsers block autoplayed speech in production, so keep instructions manual.
   useEffect(() => {
     if (mounted && isClient && voicesLoaded && !hasPlayedWelcome) {
-      // Try to speak automatically
-      console.log("Attempting to speak welcome message");
-      speakWelcomeMessage();
-      
-      // Add a fallback for browsers that block auto-speech
-      const interactionTimeout = setTimeout(() => {
-        if (!isSpeaking && !hasPlayedWelcome) {
-          console.log("Speech might be blocked, setting flag");
-          setSpeechBlocked(true);
-          setDebugMessageInternal('Please click "Play Instructions" to hear guidance');
-        }
-      }, 2000);
-      
-      return () => clearTimeout(interactionTimeout);
+      setSpeechBlocked(true);
     }
-  }, [mounted, isClient, voicesLoaded, hasPlayedWelcome, isSpeaking, speakWelcomeMessage]);
+  }, [mounted, isClient, voicesLoaded, hasPlayedWelcome]);
 
   // Add a manual interaction handler for browsers that block auto-play audio
   const handleManualSpeech = () => {
@@ -462,7 +450,7 @@ const SignDetection: React.FC<SignDetectionProps> = React.memo(() => {
       setHasPlayedWelcome(false);
       sessionStorage.removeItem('welcomeMessagePlayed');
       // Try speaking again
-      speakWelcomeMessage();
+      speakWelcomeMessage(true);
     }
   };
   
@@ -572,8 +560,8 @@ const SignDetection: React.FC<SignDetectionProps> = React.memo(() => {
     try {
       setPrediction("Processing video...");
       const formData = new FormData();
-      formData.append("video", videoBlob, `sign_${Date.now()}.webm`);
-
+      const extension = getRecordingExtension(videoBlob.type);
+      formData.append("video", videoBlob, `sign_${Date.now()}.${extension}`);
       const controller = new AbortController();
       const timeoutId = setTimeout(
         () => controller.abort(),
