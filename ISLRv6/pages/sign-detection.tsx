@@ -141,6 +141,24 @@ const API_BASE_URL =
   "http://localhost:5000";
 const PREDICTION_TIMEOUT_MS = 180000;
 const MAX_RECORDING_DURATION = 10;
+const VIDEO_CONSTRAINTS: MediaTrackConstraints = {
+  width: { ideal: 640, max: 640 },
+  height: { ideal: 480, max: 480 },
+  frameRate: { ideal: 15, max: 15 },
+  facingMode: "user",
+};
+const RECORDER_MIME_TYPES = [
+  "video/webm;codecs=vp8",
+  "video/webm",
+  "video/mp4",
+];
+const RECORDING_BITS_PER_SECOND = 350_000;
+
+function getSupportedRecordingMimeType() {
+  return RECORDER_MIME_TYPES.find((mimeType) =>
+    typeof MediaRecorder !== "undefined" && MediaRecorder.isTypeSupported(mimeType)
+  );
+}
 
 // Add elegant shapes for visual consistency with home page
 function ElegantShape({
@@ -495,12 +513,12 @@ const SignDetection: React.FC<SignDetectionProps> = React.memo(() => {
         const videoElement = webcamRef.current.video;
         if (!videoElement?.srcObject) return;
 
-        const mediaRecorder = new MediaRecorder(
-          videoElement.srcObject as MediaStream,
-          {
-            mimeType: "video/webm;codecs=vp9",
-          }
-        );
+        const mimeType = getSupportedRecordingMimeType();
+        const mediaRecorder = new MediaRecorder(videoElement.srcObject as MediaStream, {
+          ...(mimeType ? { mimeType } : {}),
+          videoBitsPerSecond: RECORDING_BITS_PER_SECOND,
+        });
+
 
         let chunks: Blob[] = [];
 
@@ -509,7 +527,11 @@ const SignDetection: React.FC<SignDetectionProps> = React.memo(() => {
         };
 
         mediaRecorder.onstop = () => {
-          const blob = new Blob(chunks, { type: "video/webm" });
+          setCapturing(false);
+          setIsDetecting(false);
+          setTimer(0);
+          setPrediction("Processing video...");
+          const blob = new Blob(chunks, { type: mediaRecorder.mimeType || "video/webm" });
           void sendVideoForProcessing(blob);
           chunks = [];
         };
@@ -981,6 +1003,7 @@ const SignDetection: React.FC<SignDetectionProps> = React.memo(() => {
                           audio={false}
                           ref={webcamRef}
                           screenshotFormat="image/jpeg"
+                          videoConstraints={VIDEO_CONSTRAINTS}
                           className="w-full h-full object-cover rounded-lg"
                           style={{ transform: "scaleX(-1)" }}
                         />
