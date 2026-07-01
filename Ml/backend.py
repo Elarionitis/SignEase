@@ -40,10 +40,19 @@ interpreter = None
 prediction_fn = None
 ORD2SIGN = None
 mp_holistic = None
+holistic = None
 inference_lock = threading.Lock()
+holistic_lock = threading.Lock()
+resource_lock = threading.Lock()
 
 FRAME_SAMPLE_RATE = 3
 ROWS_PER_FRAME = 543
+LANDMARK_LAYOUT = (
+    ("face", "face_landmarks", 468),
+    ("left_hand", "left_hand_landmarks", 21),
+    ("pose", "pose_landmarks", 33),
+    ("right_hand", "right_hand_landmarks", 21),
+)
 REQUIRED_FILES = (dummy_parquet_skel_file, tflite_model, csv_file)
 
 
@@ -57,70 +66,83 @@ def handle_exception(error):
 
 
 def load_ml_resources():
-    global xyz, interpreter, prediction_fn, ORD2SIGN, mp_holistic
+    global xyz, interpreter, prediction_fn, ORD2SIGN, mp_holistic, holistic
 
     if prediction_fn is not None:
         return
 
-    missing_files = [path for path in REQUIRED_FILES if not os.path.isfile(path)]
-    if missing_files:
-        raise RuntimeError(f"Missing ML asset(s): {', '.join(missing_files)}")
+    with resource_lock:
+        if prediction_fn is not None:
+            return
 
-    import mediapipe as mp
-    try:
-        from tflite_runtime.interpreter import Interpreter
-    except ImportError:
-        from tensorflow.lite import Interpreter
+        missing_files = [path for path in REQUIRED_FILES if not os.path.isfile(path)]
+        if missing_files:
+            raise RuntimeError(f"Missing ML asset(s): {', '.join(missing_files)}")
 
-    if not hasattr(mp, "solutions"):
-        raise RuntimeError(
-            "Installed mediapipe package does not include the legacy solutions "
-            "API required by this backend. Use mediapipe==0.10.11."
-        )
+        import mediapipe as mp
+        try:
+            from tflite_runtime.interpreter import Interpreter
+        except ImportError:
+            from tensorflow.lite import Interpreter
 
-    mp_holistic = mp.solutions.holistic
-    xyz = pd.read_parquet(dummy_parquet_skel_file)
+        if not hasattr(mp, "solutions"):
+            raise RuntimeError(
+                "Installed mediapipe package does not include the legacy solutions "
+                "API required by this backend. Use mediapipe==0.10.11."
+            )
 
-    required_skel_columns = {"type", "landmark_index"}
-    if not required_skel_columns.issubset(xyz.columns):
-        raise RuntimeError("Skeleton parquet is missing required landmark columns")
+        mp_holistic = mp.solutions.holistic
+        xyz = pd.read_parquet(dummy_parquet_skel_file, columns=["type", "landmark_index"])
 
-    xyz = xyz[["type", "landmark_index"]].drop_duplicates().reset_index(drop=True)
-    if len(xyz) != ROWS_PER_FRAME:
-        raise RuntimeError(f"Skeleton parquet has {len(xyz)} rows; expected {ROWS_PER_FRAME}")
+        required_skel_columns = {"type", "landmark_index"}
+        if not required_skel_columns.issubset(xyz.columns):
+            raise RuntimeError("Skeleton parquet is missing required landmark columns")
 
-    interpreter = Interpreter(model_path=tflite_model, num_threads=1)
-    signature_list = interpreter.get_signature_list()
-    serving_signature = signature_list.get("serving_default")
-    if not serving_signature:
-        raise RuntimeError("TFLite model is missing the serving_default signature")
-    if "inputs" not in serving_signature.get("inputs", []):
-        raise RuntimeError("TFLite serving_default signature is missing the inputs tensor")
-    if "outputs" not in serving_signature.get("outputs", []):
-        raise RuntimeError("TFLite serving_default signature is missing the outputs tensor")
-    prediction_fn = interpreter.get_signature_runner("serving_default")
+        xyz = xyz[["type", "landmark_index"]].drop_duplicates().reset_index(drop=True)
+        if len(xyz) != ROWS_PER_FRAME:
+            raise RuntimeError(f"Skeleton parquet has {len(xyz)} rows; expected {ROWS_PER_FRAME}")
+        expected_order = [
+            (landmark_type, landmark_index)
+            for landmark_type, _, count in LANDMARK_LAYOUT
+            for landmark_index in range(count)
+        ]
+        actual_order = list(xyz.itertuples(index=False, name=None))
+        if actual_order != expected_order:
+            raise RuntimeError("Skeleton parquet landmark order does not match model preprocessing layout")
 
-    train = pd.read_csv(csv_file)
-    if "sign" not in train.columns:
-        raise RuntimeError("Training CSV is missing the sign column")
-    train["sign_ord"] = train["sign"].astype("category").cat.codes
-    ORD2SIGN = train[["sign_ord", "sign"]].set_index("sign_ord").squeeze().to_dict()
+        interpreter = Interpreter(model_path=tflite_model, num_threads=1)
+        signature_list = interpreter.get_signature_list()
+        serving_signature = signature_list.get("serving_default")
+        if not serving_signature:
+            raise RuntimeError("TFLite model is missing the serving_default signature")
+        if "inputs" not in serving_signature.get("inputs", []):
+            raise RuntimeError("TFLite serving_default signature is missing the inputs tensor")
+        if "outputs" not in serving_signature.get("outputs", []):
+            raise RuntimeError("TFLite serving_default signature is missing the outputs tensor")
+        prediction_fn = interpreter.get_signature_runner("serving_default")
+
+        train = pd.read_csv(csv_file)
+        if "sign" not in train.columns:
+            raise RuntimeError("Training CSV is missing the sign column")
+        train["sign_ord"] = train["sign"].astype("category").cat.codes
+        ORD2SIGN = train[["sign_ord", "sign"]].set_index("sign_ord").squeeze().to_dict()
+        holistic = mp_holistic.Holistic(min_detection_confidence=0.5, min_tracking_confidence=0.5)
 
 
-def create_frame_landmark_df(results, frame, xyz):
-    """Extracts and formats landmark data for a given frame."""
-    data = []
+def landmarks_to_frame_array(results):
+    frame_landmarks = np.full((ROWS_PER_FRAME, 3), np.nan, dtype=np.float32)
+    offset = 0
 
-    for landmark_type, landmark_data in zip(
-        ['face', 'pose', 'left_hand', 'right_hand'],
-        [results.face_landmarks, results.pose_landmarks, results.left_hand_landmarks, results.right_hand_landmarks]
-    ):
+    for _, result_attr, count in LANDMARK_LAYOUT:
+        landmark_data = getattr(results, result_attr)
         if landmark_data:
-            for i, point in enumerate(landmark_data.landmark):
-                data.append([landmark_type, i, point.x, point.y, point.z])
+            points = landmark_data.landmark
+            frame_landmarks[offset:offset + count, 0] = [point.x for point in points]
+            frame_landmarks[offset:offset + count, 1] = [point.y for point in points]
+            frame_landmarks[offset:offset + count, 2] = [point.z for point in points]
+        offset += count
 
-    df = pd.DataFrame(data, columns=['type', 'landmark_index', 'x', 'y', 'z'])
-    return xyz.merge(df, on=['type', 'landmark_index'], how='left').assign(frame=frame)
+    return frame_landmarks
 
 
 def process_video(video_path):
@@ -135,16 +157,17 @@ def process_video(video_path):
     frame = 0
     all_landmarks = []
 
-    with mp_holistic.Holistic(min_detection_confidence=0.5, min_tracking_confidence=0.5) as holistic:
+    with holistic_lock:
         while cap.isOpened():
             success, image = cap.read()
             if not success:
                 break
 
             if frame % FRAME_SAMPLE_RATE == 0:
+                image.flags.writeable = False
                 image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
                 results = holistic.process(image)
-                all_landmarks.append(create_frame_landmark_df(results, frame, xyz))
+                all_landmarks.append(landmarks_to_frame_array(results))
 
             frame += 1
 
@@ -153,22 +176,7 @@ def process_video(video_path):
     if not all_landmarks:
         return None  # No landmarks were detected
 
-    df = pd.concat(all_landmarks).reset_index(drop=True)
-    return dataframe_to_model_input(df)
-
-
-def dataframe_to_model_input(dataframe):
-    """Loads and reshapes landmark data for model input."""
-    data = dataframe[['x', 'y', 'z']]
-
-    if data.empty:
-        return np.array([])  # Return an empty array if no data is present
-
-    n_frames = len(data) // ROWS_PER_FRAME
-    if n_frames == 0 or len(data) % ROWS_PER_FRAME != 0:
-        return np.array([])
-
-    return data.values.reshape(n_frames, ROWS_PER_FRAME, 3).astype(np.float32)
+    return np.stack(all_landmarks, axis=0)
 
 
 def normalize_model_outputs(outputs):
@@ -264,8 +272,6 @@ def predict():
         },
     }
 
-    app.logger.info("Prediction response: %s", response)
-
     if ENABLE_TTS:
         try:
             tts = gTTS(text=detected_sign, lang='en')
@@ -286,6 +292,10 @@ def get_audio():
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok"})
+
+
+if os.environ.get("EAGER_LOAD_ML", "true").lower() == "true":
+    load_ml_resources()
 
 
 if __name__ == "__main__":
