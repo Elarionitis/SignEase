@@ -605,6 +605,7 @@ const SignDetection: React.FC<SignDetectionProps> = React.memo(() => {
         });
 
         speakPrediction(detectedSign);
+
       } finally {
         clearTimeout(timeoutId);
       }

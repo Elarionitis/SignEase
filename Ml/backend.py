@@ -297,7 +297,7 @@ def health():
     return jsonify({"status": "ok"})
 
 
-if os.environ.get("EAGER_LOAD_ML", "false").lower() == "true":
+if os.environ.get("EAGER_LOAD_ML", "true").lower() == "true":
     load_ml_resources()
 
 
