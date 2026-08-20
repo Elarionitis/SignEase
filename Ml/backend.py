@@ -84,12 +84,12 @@ def load_ml_resources():
         try:
             from tflite_runtime.interpreter import Interpreter
         except ImportError:
-            from tensorflow.lite import Interpreter
+            from tensorflow.lite.python.interpreter import Interpreter
 
         if not hasattr(mp, "solutions"):
             raise RuntimeError(
                 "Installed mediapipe package does not include the legacy solutions "
-                "API required by this backend. Use mediapipe==0.10.11."
+                "API required by this backend. Use mediapipe==0.10.14."
         )
 
         mp_holistic = mp.solutions.holistic
