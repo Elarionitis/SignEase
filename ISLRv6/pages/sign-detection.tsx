@@ -160,6 +160,7 @@ const RECORDER_MIME_TYPES = [
 // A modest bitrate keeps MediaRecorder from competing with the live preview
 // (or an OS screen recorder) for encoder resources.
 const RECORDING_BITS_PER_SECOND = 250_000;
+const WELCOME_SPEECH_SESSION_KEY = "welcomeMessagePlayed";
 
 function getSupportedRecordingMimeType() {
   return RECORDER_MIME_TYPES.find((mimeType) =>
@@ -265,6 +266,7 @@ const SignDetection: React.FC<SignDetectionProps> = React.memo(() => {
   const [hasPlayedWelcome, setHasPlayedWelcome] = useState<boolean>(false);
   const [isSpeaking, setIsSpeaking] = useState<boolean>(false);
   const speechSynthesisRef = useRef<SpeechSynthesis | null>(null);
+  const welcomeSpeechAttemptedRef = useRef(false);
   // Add state to track voice loading and initial prompt
   const [voicesLoaded, setVoicesLoaded] = useState<boolean>(false);
   const [speechBlocked, setSpeechBlocked] = useState<boolean>(false);
@@ -364,16 +366,28 @@ const SignDetection: React.FC<SignDetectionProps> = React.memo(() => {
 
   const speakWelcomeMessage = useCallback((force = false) => {
     // Don't try to speak if we've already done it or if speech synthesis isn't available
-    if ((!force && hasPlayedWelcome) || !speechSynthesisRef.current || !('speechSynthesis' in window)) {
+    if (
+      (!force && (hasPlayedWelcome || welcomeSpeechAttemptedRef.current)) ||
+      !speechSynthesisRef.current ||
+      !('speechSynthesis' in window)
+    ) {
       return;
     }
 
     try {
-      // Check if we already played the welcome message in this session
-      const hasPlayed = sessionStorage.getItem('welcomeMessagePlayed');
+      // Keep automatic instructions to one attempt per browser tab. Mark this
+      // before speaking because route changes and browser interruptions can
+      // cancel an utterance before its `onend` event fires.
+      const hasPlayed = sessionStorage.getItem(WELCOME_SPEECH_SESSION_KEY);
       if (hasPlayed && !force) {
         setHasPlayedWelcome(true);
         return;
+      }
+
+      if (!force) {
+        welcomeSpeechAttemptedRef.current = true;
+        sessionStorage.setItem(WELCOME_SPEECH_SESSION_KEY, 'true');
+        setHasPlayedWelcome(true);
       }
 
       // Cancel any existing speech
@@ -408,8 +422,7 @@ const SignDetection: React.FC<SignDetectionProps> = React.memo(() => {
         setHasPlayedWelcome(true);
         // Only log internally, don't show to user
         setDebugMessageInternal('Speech completed');
-        // Mark that we've played the welcome message in this session
-        sessionStorage.setItem('welcomeMessagePlayed', 'true');
+        sessionStorage.setItem(WELCOME_SPEECH_SESSION_KEY, 'true');
       };
       
       welcomeMessage.onerror = () => {
@@ -490,8 +503,6 @@ const SignDetection: React.FC<SignDetectionProps> = React.memo(() => {
     if (speechSynthesisRef.current && !isSpeaking) {
       // Reset speech flags
       setSpeechBlocked(false);
-      setHasPlayedWelcome(false);
-      sessionStorage.removeItem('welcomeMessagePlayed');
       // Try speaking again
       speakWelcomeMessage(true);
     }
@@ -963,7 +974,7 @@ const SignDetection: React.FC<SignDetectionProps> = React.memo(() => {
                   between the hearing and deaf communities.
                 </motion.p>
                 {/* Show initial prompt for speech if blocked */}
-                {speechBlocked && !isSpeaking && !hasPlayedWelcome && (
+                {speechBlocked && !isSpeaking && (
                   <motion.div
                     initial={{ opacity: 0, y: -10 }}
                     animate={{ opacity: 1, y: 0 }}
@@ -1003,7 +1014,7 @@ const SignDetection: React.FC<SignDetectionProps> = React.memo(() => {
                           speechSynthesisRef.current.cancel();
                           setIsSpeaking(false);
                           setHasPlayedWelcome(true);
-                          sessionStorage.setItem('welcomeMessagePlayed', 'true');
+                          sessionStorage.setItem(WELCOME_SPEECH_SESSION_KEY, 'true');
                         }
                       }}
                       className="ml-2 text-xs text-white/60 hover:text-white/90"
