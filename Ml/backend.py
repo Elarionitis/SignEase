@@ -149,17 +149,14 @@ def hands_detected(results):
     return bool(results.left_hand_landmarks or results.right_hand_landmarks)
 
 
-def get_target_frame_indices(cap):
-    total_frames = int(cap.get(7) or 0)
-    if total_frames <= 0:
-        return None
-
-    sampled_count = min(MAX_SAMPLED_FRAMES, max(1, (total_frames + FRAME_SAMPLE_RATE - 1) // FRAME_SAMPLE_RATE))
-    return set(np.linspace(0, total_frames - 1, sampled_count, dtype=np.int32).tolist())
-
-
 def process_video(video_path):
-    """Processes the uploaded video and returns model-ready landmark tensors."""
+    """Processes browser-recorded video and returns model-ready landmark tensors.
+
+    Do not seek based on ``CAP_PROP_FRAME_COUNT`` here. WebM files emitted by
+    MediaRecorder frequently report incomplete frame metadata (particularly
+    while the device is also screen recording), so seeking can repeatedly read
+    only an early frame and miss the user's hands entirely.
+    """
     import cv2
 
     load_ml_resources()
@@ -168,26 +165,9 @@ def process_video(video_path):
         return None  # Ensure the file is readable
 
     all_landmarks = []
-    target_frame_indices = get_target_frame_indices(cap)
-
-    with holistic_lock:
-        if target_frame_indices is not None:
-            for frame_index in sorted(target_frame_indices):
-                if len(all_landmarks) >= MAX_SAMPLED_FRAMES:
-                    break
-
-                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
-                success, image = cap.read()
-                if not success:
-                    continue
-
-                image.flags.writeable = False
-                image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-                results = holistic.process(image)
-                if hands_detected(results):
-                    all_landmarks.append(landmarks_to_frame_array(results))
-        else:
-            frame = 0
+    frame = 0
+    try:
+        with holistic_lock:
             while cap.isOpened() and len(all_landmarks) < MAX_SAMPLED_FRAMES:
                 success, image = cap.read()
                 if not success:
@@ -201,8 +181,8 @@ def process_video(video_path):
                         all_landmarks.append(landmarks_to_frame_array(results))
 
                 frame += 1
-
-    cap.release()  # Ensure resources are released
+    finally:
+        cap.release()
 
     if not all_landmarks:
         return None  # No usable hand landmarks were detected

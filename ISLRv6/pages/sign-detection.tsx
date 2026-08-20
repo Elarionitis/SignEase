@@ -147,7 +147,9 @@ const MAX_RECORDING_DURATION = 10;
 const VIDEO_CONSTRAINTS: MediaTrackConstraints = {
   width: { ideal: 640, max: 640 },
   height: { ideal: 480, max: 480 },
-  frameRate: { ideal: 15, max: 15 },
+  // The old 15 fps cap made this page visibly less fluid than the rest of the
+  // app. Let the camera preview use its normal smooth cadence.
+  frameRate: { ideal: 24, max: 30 },
   facingMode: "user",
 };
 const RECORDER_MIME_TYPES = [
@@ -155,7 +157,9 @@ const RECORDER_MIME_TYPES = [
   "video/webm",
   "video/mp4",
 ];
-const RECORDING_BITS_PER_SECOND = 350_000;
+// A modest bitrate keeps MediaRecorder from competing with the live preview
+// (or an OS screen recorder) for encoder resources.
+const RECORDING_BITS_PER_SECOND = 250_000;
 
 function getSupportedRecordingMimeType() {
   return RECORDER_MIME_TYPES.find((mimeType) =>
