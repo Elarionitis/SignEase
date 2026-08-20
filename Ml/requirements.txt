@@ -5,4 +5,6 @@ gTTS==2.5.3
 mediapipe==0.10.14
 numpy==1.26.4
 opencv-python-headless==4.10.0.84
-tensorflow==2.16.2
+# The model is a .tflite model. The full TensorFlow package exceeds the
+# memory available on Render's 512 MB instance after MediaPipe is loaded.
+tflite-runtime==2.14.0

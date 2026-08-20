@@ -1,6 +1,7 @@
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 import csv
+import logging
 import os
 import time
 import threading
@@ -25,6 +26,14 @@ app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = int(os.environ.get("MAX_UPLOAD_MB", "8")) * 1024 * 1024
 CORS(app, resources={r"/*": {"origins": "*"}})
 
+# Flask defaults to warning-level logs under Gunicorn, which hid the request
+# timing needed to diagnose production prediction failures.
+gunicorn_logger = logging.getLogger("gunicorn.error")
+if gunicorn_logger.handlers:
+    app.logger.handlers = gunicorn_logger.handlers
+app.logger.setLevel(logging.INFO)
+app.logger.propagate = False
+
 ML_DIR = os.path.join(BASE_DIR, "ML_Code_ISL")
 
 UPLOAD_FOLDER = os.path.join(BASE_DIR, "saved_videos")
@@ -45,8 +54,10 @@ inference_lock = threading.Lock()
 holistic_lock = threading.Lock()
 resource_lock = threading.Lock()
 
-FRAME_SAMPLE_RATE = int(os.environ.get("FRAME_SAMPLE_RATE", "6"))
-MAX_SAMPLED_FRAMES = int(os.environ.get("MAX_SAMPLED_FRAMES", "16"))
+# At the default short recording length, every second frame gives the model a
+# full temporal sequence instead of only a handful of snapshots.
+FRAME_SAMPLE_RATE = int(os.environ.get("FRAME_SAMPLE_RATE", "2"))
+MAX_SAMPLED_FRAMES = int(os.environ.get("MAX_SAMPLED_FRAMES", "12"))
 ROWS_PER_FRAME = 543
 LANDMARK_LAYOUT = (
     ("face", "face_landmarks", 468),
@@ -83,8 +94,11 @@ def load_ml_resources():
         import mediapipe as mp
         try:
             from tflite_runtime.interpreter import Interpreter
-        except ImportError:
-            from tensorflow.lite.python.interpreter import Interpreter
+        except ImportError as error:
+            raise RuntimeError(
+                "tflite-runtime is required for inference; install the pinned "
+                "dependency from requirements.txt"
+            ) from error
 
         if not hasattr(mp, "solutions"):
             raise RuntimeError(
@@ -130,6 +144,11 @@ def landmarks_to_frame_array(results):
     return frame_landmarks
 
 
+def hands_detected(results):
+    """A sign sample is only useful to the model when at least one hand is visible."""
+    return bool(results.left_hand_landmarks or results.right_hand_landmarks)
+
+
 def get_target_frame_indices(cap):
     total_frames = int(cap.get(7) or 0)
     if total_frames <= 0:
@@ -165,7 +184,8 @@ def process_video(video_path):
                 image.flags.writeable = False
                 image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
                 results = holistic.process(image)
-                all_landmarks.append(landmarks_to_frame_array(results))
+                if hands_detected(results):
+                    all_landmarks.append(landmarks_to_frame_array(results))
         else:
             frame = 0
             while cap.isOpened() and len(all_landmarks) < MAX_SAMPLED_FRAMES:
@@ -177,15 +197,17 @@ def process_video(video_path):
                     image.flags.writeable = False
                     image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
                     results = holistic.process(image)
-                    all_landmarks.append(landmarks_to_frame_array(results))
+                    if hands_detected(results):
+                        all_landmarks.append(landmarks_to_frame_array(results))
 
                 frame += 1
 
     cap.release()  # Ensure resources are released
 
     if not all_landmarks:
-        return None  # No landmarks were detected
+        return None  # No usable hand landmarks were detected
 
+    app.logger.info("Extracted %s hand-visible frames for prediction", len(all_landmarks))
     return np.stack(all_landmarks, axis=0)
 
 
@@ -233,10 +255,17 @@ def get_prediction(model_input):
     outputs = normalize_model_outputs(prediction.get('outputs', None))
 
     if outputs.size == 0:
+        app.logger.warning("Model returned no usable prediction scores")
         return "Unknown", 0.0  # Handle missing model output
 
     sign_ord = int(outputs.argmax())
     sign = ORD2SIGN.get(sign_ord, "Unknown")
+    if sign == "Unknown":
+        app.logger.warning(
+            "Model returned label index %s, but only %s labels are configured",
+            sign_ord,
+            len(ORD2SIGN),
+        )
     pred_conf = display_confidence(float(outputs[sign_ord])) if sign != "Unknown" else 0.0
 
     return sign, pred_conf
@@ -246,6 +275,7 @@ def get_prediction(model_input):
 def predict():
     """Handles video upload, processing, prediction, and generates speech output."""
     started_at = time.perf_counter()
+    app.logger.info("Prediction request received (content_length=%s)", request.content_length)
     if "video" not in request.files:
         return jsonify({"error": "No video uploaded"}), 400
 
@@ -261,6 +291,11 @@ def predict():
     try:
         model_input = process_video(video_path)
         processed_at = time.perf_counter()
+
+        if model_input is None:
+            return jsonify({
+                "error": "No hands detected in the recording. Keep at least one hand clearly visible and try again."
+            }), 422
 
         detected_sign, confidence = get_prediction(model_input)
         predicted_at = time.perf_counter()
@@ -290,6 +325,7 @@ def predict():
         except Exception as error:
             app.logger.warning("TTS generation failed: %s", error)
 
+    app.logger.info("Prediction completed in %.3fs", response["timing"]["total_seconds"])
     return jsonify(response)
 
 
@@ -301,11 +337,22 @@ def get_audio():
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok"})
+    return jsonify({"status": "ok", "model_loaded": prediction_fn is not None})
 
 
-if os.environ.get("EAGER_LOAD_ML", "true").lower() == "true":
+@app.route("/warmup", methods=["GET"])
+def warmup():
+    """Loads and caches ML resources before the user submits a recording."""
+    started_at = time.perf_counter()
+    app.logger.info("Model warmup requested")
     load_ml_resources()
+    elapsed = time.perf_counter() - started_at
+    app.logger.info("Model warmup completed in %.3fs", elapsed)
+    return jsonify({"status": "ready", "warmup_seconds": round(elapsed, 3)})
+
+
+# Keep service boot light so Render can accept /health requests immediately.
+# The ML resources are loaded once, only when the first /predict request arrives.
 
 
 if __name__ == "__main__":

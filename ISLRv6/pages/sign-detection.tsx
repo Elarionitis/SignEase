@@ -139,7 +139,10 @@ const inter = { variable: "font-sans" };
 const API_BASE_URL =
   process.env.NEXT_PUBLIC_API_BASE_URL?.replace(/\/$/, "") ||
   "http://localhost:5000";
-const PREDICTION_TIMEOUT_MS = 180000;
+// A warm prediction normally finishes in a few seconds.  This still leaves room
+// for a Render cold start, without leaving the result screen stuck for 3 minutes.
+const PREDICTION_TIMEOUT_MS = 75_000;
+const BACKEND_WARMUP_TIMEOUT_MS = 60_000;
 const MAX_RECORDING_DURATION = 10;
 const VIDEO_CONSTRAINTS: MediaTrackConstraints = {
   width: { ideal: 640, max: 640 },
@@ -243,7 +246,9 @@ const SignDetection: React.FC<SignDetectionProps> = React.memo(() => {
   const webcamRef = useRef<Webcam>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const [videoChunks, setVideoChunks] = useState<Blob[]>([]);
-  const [duration, setDuration] = useState<number>(2);
+  // Three seconds gives the recognition model enough motion to distinguish
+  // dynamic signs without making the interaction feel slow.
+  const [duration, setDuration] = useState<number>(3);
   const [prediction, setPrediction] = useState<string>("No sign detected");
   const [isDetecting, setIsDetecting] = useState<boolean>(false);
   const [timer, setTimer] = useState<number>(0);
@@ -279,6 +284,40 @@ const SignDetection: React.FC<SignDetectionProps> = React.memo(() => {
   // Handle mounting
   useEffect(() => {
     setMounted(true);
+  }, []);
+
+  // Load the model while the user is setting up their recording. This avoids
+  // making the first prediction wait for a cold Render ML initialization.
+  useEffect(() => {
+    const controller = new AbortController();
+    const timeoutId = window.setTimeout(
+      () => controller.abort(),
+      BACKEND_WARMUP_TIMEOUT_MS
+    );
+
+    void fetch(`${API_BASE_URL}/warmup`, { signal: controller.signal })
+      .then(async (response) => {
+        if (!response.ok) {
+          throw new Error(`Model warmup failed (${response.status})`);
+        }
+        const data = await response.json();
+        console.info("[SignEase] Prediction model is ready", {
+          url: API_BASE_URL,
+          warmupSeconds: data.warmup_seconds,
+        });
+      })
+      .catch((error: unknown) => {
+        console.warn("[SignEase] Prediction model warmup failed", {
+          url: API_BASE_URL,
+          error: error instanceof Error ? error.message : error,
+        });
+      })
+      .finally(() => window.clearTimeout(timeoutId));
+
+    return () => {
+      window.clearTimeout(timeoutId);
+      controller.abort();
+    };
   }, []);
 
   // Get voices and check if they're available
@@ -559,6 +598,11 @@ const SignDetection: React.FC<SignDetectionProps> = React.memo(() => {
   const sendVideoForProcessing = React.useCallback(async (videoBlob: Blob) => {
     try {
       setPrediction("Processing video...");
+      console.info("[SignEase] Starting prediction request", {
+        url: `${API_BASE_URL}/predict`,
+        videoBytes: videoBlob.size,
+        videoType: videoBlob.type,
+      });
       const formData = new FormData();
       const extension = getRecordingExtension(videoBlob.type);
       formData.append("video", videoBlob, `sign_${Date.now()}.${extension}`);
@@ -617,7 +661,7 @@ const SignDetection: React.FC<SignDetectionProps> = React.memo(() => {
           : error instanceof SyntaxError
             ? "Server returned an invalid response. Please try again."
             : error instanceof TypeError
-              ? "Could not reach the prediction server. Check if the Render backend is running."
+              ? `Could not reach the prediction server at ${API_BASE_URL}. Make sure the backend is running and reachable.`
             : error instanceof Error
               ? error.message
               : "Error processing video"

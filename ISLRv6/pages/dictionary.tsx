@@ -9,7 +9,7 @@ import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { cn } from "@/lib/utils"
 import Background from "@/components/background"
-import { FaArrowRight, FaSearch, FaExternalLinkAlt, FaPlayCircle } from 'react-icons/fa'
+import { FaArrowRight, FaSearch, FaExternalLinkAlt, FaPlayCircle, FaTimes } from 'react-icons/fa'
 import {
   Table,
   TableBody,
@@ -190,6 +190,13 @@ const SignSearch: React.FC = () => {
     setSearchQuery(e.target.value);
     setShowDropdown(true); // Show dropdown on input change
     setCurrentPage(1); // Reset to first page on new search
+  };
+
+  const clearSearch = () => {
+    setSearchQuery("");
+    setShowDropdown(false);
+    setCurrentPage(1);
+    setSelectedSignIndex(null);
   };
 
   const handleSignClick = (index: number) => {
@@ -393,7 +400,19 @@ const SignSearch: React.FC = () => {
                     value={searchQuery}
                     onChange={handleInputChange}
                   />
-                  <div className="absolute right-4 top-1/2 transform -translate-y-1/2 text-white/40">
+                  {searchQuery && (
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon"
+                      onClick={clearSearch}
+                      aria-label="Clear sign search"
+                      className="absolute right-12 top-1/2 -translate-y-1/2 h-9 w-9 rounded-full text-white/50 hover:bg-white/10 hover:text-white"
+                    >
+                      <FaTimes className="text-base" />
+                    </Button>
+                  )}
+                  <div className="absolute right-4 top-1/2 transform -translate-y-1/2 text-white/40 pointer-events-none">
                     <FaSearch className="text-lg" />
                   </div>
                   {/* Improve the dropdown suggestions to make them more interactive */}
@@ -521,7 +540,7 @@ const SignSearch: React.FC = () => {
                         Type the name of a sign above to find video tutorials and improve your sign language skills.
                       </p>
                       <div className="grid gap-2 grid-cols-2 sm:grid-cols-3 md:grid-cols-4 max-w-xl">
-                        {["Hello", "Thank", "Bird", "Apple", "Happy", "Boy", "Girl", "Home"].map((suggestion, i) => (
+                        {["Hello", "Thank", "Bird", "Apple", "Happy", "Boy", "Girl", "Home", "Donkey"].map((suggestion, i) => (
                           <Button
                             key={suggestion}
                             variant="outline"
