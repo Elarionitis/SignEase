@@ -361,11 +361,6 @@ export default function PixelCard({
     <div
       ref={containerRef}
       className={`relative overflow-hidden grid place-items-center border border-[#27272a] rounded-[25px] isolate transition-colors duration-200 [transition-timing-function:cubic-bezier(0.5,1,0.89,1)] select-none ${className}`}
-      style={{ 
-        aspectRatio: "auto", 
-        minHeight: "250px", 
-        minWidth: "500px" 
-      }}
       onMouseEnter={onMouseEnter}
       onMouseLeave={onMouseLeave}
       onFocus={finalNoFocus ? undefined : onFocus}
