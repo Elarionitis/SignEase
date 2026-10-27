@@ -1,40 +1,84 @@
-"use client"
-
 import * as React from "react"
 import { useState, useEffect, useMemo, useRef } from "react"
-import { motion, AnimatePresence } from "framer-motion"
+import fs from "fs"
+import path from "path"
+import type { GetStaticProps } from "next"
+import Head from "next/head"
+import { motion } from "framer-motion"
 import Link from "next/link"
 import Image from "next/image"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { cn } from "@/lib/utils"
 import Background from "@/components/background"
-import { FaArrowRight, FaSearch, FaExternalLinkAlt, FaPlayCircle, FaTimes } from 'react-icons/fa'
+import { FaArrowRight, FaSearch, FaPlayCircle, FaTimes, FaVideoSlash } from 'react-icons/fa'
 import {
   Table,
   TableBody,
-  TableCaption,
   TableCell,
   TableHead,
   TableHeader,
   TableRow,
 } from "@/components/ui/table"
-import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog"
+import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog"
 import {
   Pagination,
   PaginationContent,
+  PaginationEllipsis,
   PaginationItem,
   PaginationLink,
   PaginationNext,
   PaginationPrevious,
 } from "@/components/ui/pagination"
+import signMap from "@/data/sign_to_prediction_index_map.json"
 
 const pacifico = { className: "font-serif", variable: "font-serif" };
 const inter = { variable: "font-sans" };
 
+const SIGNS_PER_PAGE = 10;
+const SUGGESTIONS = ["Hello", "Thank", "Bird", "Apple", "Happy", "Boy", "Girl", "Home", "Donkey"];
+
 interface Sign {
   name: string;
   index: number;
+  hasVideo: boolean;
+}
+
+interface SignSearchProps {
+  signs: Sign[];
+}
+
+// The sign list and which demo videos exist are both known at build time, so
+// the page ships with them instead of fetching and probing in the browser.
+export const getStaticProps: GetStaticProps<SignSearchProps> = async () => {
+  const videoDir = path.join(process.cwd(), "public", "videos", "signs");
+  const videos = new Set(
+    fs.existsSync(videoDir)
+      ? fs.readdirSync(videoDir).filter((file) => file.endsWith(".mp4"))
+      : []
+  );
+  const signs = Object.entries(signMap as Record<string, number>)
+    .map(([name, index]) => ({ name, index, hasVideo: videos.has(`${index}.mp4`) }))
+    .sort((a, b) => a.name.localeCompare(b.name));
+
+  return { props: { signs } };
+};
+
+function formatSignName(name: string) {
+  return name.replace(/_/g, " ");
+}
+
+/** Page numbers to show, with null marking an ellipsis gap. */
+function visiblePages(current: number, total: number): Array<number | null> {
+  if (total <= 7) return Array.from({ length: total }, (_, i) => i + 1);
+  const pages = new Set([1, total, current - 1, current, current + 1]);
+  const sorted = Array.from(pages).filter((page) => page >= 1 && page <= total).sort((a, b) => a - b);
+  const result: Array<number | null> = [];
+  sorted.forEach((page, i) => {
+    if (i > 0 && page - sorted[i - 1] > 1) result.push(null);
+    result.push(page);
+  });
+  return result;
 }
 
 // Add elegant shapes for visual consistency with home page
@@ -104,73 +148,56 @@ function ElegantShape({
   );
 }
 
-const SignSearch: React.FC = () => {
-  const [mounted, setMounted] = useState(false);
+const SignSearch: React.FC<SignSearchProps> = ({ signs }) => {
   const [searchQuery, setSearchQuery] = useState("");
-  const [isClient, setIsClient] = useState(false);
-  const [signDatabase, setSignDatabase] = useState<Sign[]>([]);
-  const [selectedSignIndex, setSelectedSignIndex] = useState<number | null>(null);
+  const [selectedSign, setSelectedSign] = useState<Sign | null>(null);
+  const [videoFailed, setVideoFailed] = useState(false);
   const [showDropdown, setShowDropdown] = useState(false);
-  const [open, setOpen] = React.useState(false)
-  const videoRef = useRef<HTMLVideoElement>(null);
-
   const [currentPage, setCurrentPage] = useState(1);
-  const signsPerPage = 10; // You can adjust this value
+  const searchBoxRef = useRef<HTMLDivElement>(null);
 
+  // Pre-fill the search from ?query= (used by the detection page's
+  // "See how to sign it" link).
   useEffect(() => {
-    const loadData = async () => {
-      try {
-        // Fetch the sign map JSON file
-        const response = await fetch('/sign_to_prediction_index_map (1).json');
-        const signMap = await response.json();
-
-        // Create the sign database
-        const signs: Sign[] = Object.entries(signMap).map(([signName, index]) => {
-          return {
-            name: signName,
-            index: parseInt(index as string),
-          };
-        });
-
-        setSignDatabase(signs);
-      } catch (error) {
-        console.error('Failed to load data:', error);
-      }
-    };
-
-    loadData();
-  }, []);
-
-  // Prevent hydration errors
-  useEffect(() => {
-    setIsClient(true);
-    setMounted(true);
-
-    // Check for URL params to pre-fill search
-    const urlParams = new URLSearchParams(window.location.search);
-    const query = urlParams.get('query');
+    const query = new URLSearchParams(window.location.search).get("query");
     if (query) {
       setSearchQuery(query);
     }
   }, []);
 
-  // Filter signs based on search query
+  // Close the suggestions when clicking outside the search box.
+  useEffect(() => {
+    if (!showDropdown) return;
+    const handlePointerDown = (event: PointerEvent) => {
+      if (!searchBoxRef.current?.contains(event.target as Node)) {
+        setShowDropdown(false);
+      }
+    };
+    document.addEventListener("pointerdown", handlePointerDown);
+    return () => document.removeEventListener("pointerdown", handlePointerDown);
+  }, [showDropdown]);
+
+  // Filter signs based on search query; names starting with the query first.
   const filteredSigns = useMemo(() => {
-    if (!searchQuery) return [];
+    const query = searchQuery.trim().toLowerCase().replace(/\s+/g, "");
+    if (!query) return [];
 
-    return signDatabase.filter(sign =>
-      sign.name.toLowerCase().includes(searchQuery.toLowerCase())
-    );
-  }, [searchQuery, signDatabase]);
+    return signs
+      .filter((sign) => sign.name.toLowerCase().replace(/_/g, "").includes(query))
+      .sort((a, b) => {
+        const aStarts = a.name.toLowerCase().startsWith(query);
+        const bStarts = b.name.toLowerCase().startsWith(query);
+        return aStarts === bStarts ? a.name.localeCompare(b.name) : aStarts ? -1 : 1;
+      });
+  }, [searchQuery, signs]);
 
-  const totalSigns = filteredSigns.length;
-  const totalPages = Math.ceil(totalSigns / signsPerPage);
+  const totalPages = Math.max(1, Math.ceil(filteredSigns.length / SIGNS_PER_PAGE));
+  const page = Math.min(currentPage, totalPages);
 
   const currentSigns = useMemo(() => {
-    const startIndex = (currentPage - 1) * signsPerPage;
-    const endIndex = startIndex + signsPerPage;
-    return filteredSigns.slice(startIndex, endIndex);
-  }, [filteredSigns, currentPage, signsPerPage]);
+    const startIndex = (page - 1) * SIGNS_PER_PAGE;
+    return filteredSigns.slice(startIndex, startIndex + SIGNS_PER_PAGE);
+  }, [filteredSigns, page]);
 
   // Animation variants consistent with home page
   const fadeUpVariants = {
@@ -186,51 +213,34 @@ const SignSearch: React.FC = () => {
     }),
   };
 
-  const handleInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    setSearchQuery(e.target.value);
-    setShowDropdown(true); // Show dropdown on input change
-    setCurrentPage(1); // Reset to first page on new search
+  const updateQuery = (query: string, openDropdown: boolean) => {
+    setSearchQuery(query);
+    setShowDropdown(openDropdown);
+    setCurrentPage(1);
   };
 
   const clearSearch = () => {
-    setSearchQuery("");
+    updateQuery("", false);
+    setSelectedSign(null);
+  };
+
+  const openSign = (sign: Sign) => {
+    setVideoFailed(false);
+    setSelectedSign(sign);
     setShowDropdown(false);
-    setCurrentPage(1);
-    setSelectedSignIndex(null);
   };
 
-  const handleSignClick = (index: number) => {
-    setSelectedSignIndex(index);
-    
-    // This will trigger the Dialog to open with the selected sign
-    setTimeout(() => {
-      if (videoRef.current) {
-        videoRef.current.src = `/videos/signs/${index}.mp4`;
-        videoRef.current.load();
-        videoRef.current.play().catch(e => {
-          console.log("Auto-play failed, may need user interaction:", e);
-        });
-      }
-    }, 100);
+  const goToPage = (event: React.MouseEvent, target: number) => {
+    event.preventDefault();
+    setCurrentPage(Math.min(Math.max(1, target), totalPages));
   };
-
-  useEffect(() => {
-    if (selectedSignIndex !== null && videoRef.current) {
-      const videoSource = `/videos/signs/${selectedSignIndex}.mp4`;
-      videoRef.current.src = videoSource;
-      videoRef.current.load();
-      videoRef.current.play();
-    }
-  }, [selectedSignIndex]);
-
-  if (!isClient) {
-    return null; // Prevent hydration issues
-  }
-
-  if (!mounted) return null;
 
   return (
-    <div className={cn("relative min-h-screen w-full overflow-hidden bg-[#030303]", inter.variable, pacifico.variable)} suppressHydrationWarning>
+    <div className={cn("relative min-h-screen w-full overflow-hidden bg-[#030303]", inter.variable, pacifico.variable)}>
+      <Head>
+        <title>Sign Dictionary | SignEase</title>
+        <meta name="description" content="Search the 250 ASL signs SignEase recognizes and watch how to perform them." />
+      </Head>
       {/* Background with consistent styling */}
       <div className="fixed inset-0">
         <div className="absolute inset-0 bg-[#030303]" />
@@ -279,7 +289,7 @@ const SignSearch: React.FC = () => {
           <div className="absolute inset-0 bg-gradient-to-b from-black/90 via-black/50 to-transparent pointer-events-none" />
           <div className="absolute inset-0 backdrop-blur-[8px] backdrop-saturate-150 bg-black/5 pointer-events-none" />
 
-          <div className="relative z-10 flex items-center justify-between w-full px-6 min-h-[80px] py-4">
+          <div className="relative z-10 flex items-center justify-between w-full px-4 sm:px-6 min-h-[72px] sm:min-h-[80px] py-3 sm:py-4 gap-4">
             <motion.div
               custom={0}
               variants={fadeUpVariants}
@@ -309,7 +319,7 @@ const SignSearch: React.FC = () => {
               variants={fadeUpVariants}
               initial="hidden"
               animate="visible"
-              className="flex gap-4 text-white/90"
+              className="flex gap-3 sm:gap-4 text-sm sm:text-base text-white/90"
             >
               <Link
                 href="/"
@@ -325,13 +335,13 @@ const SignSearch: React.FC = () => {
               </Link>
               <Link
                 href="/#technology"
-                className="hover:text-indigo-400 transition-all hover:scale-105"
+                className="hidden md:inline hover:text-indigo-400 transition-all hover:scale-105"
               >
                 Technology
               </Link>
               <Link
                 href="/#team"
-                className="hover:text-indigo-400 transition-all hover:scale-105"
+                className="hidden md:inline hover:text-indigo-400 transition-all hover:scale-105"
               >
                 Team
               </Link>
@@ -392,13 +402,22 @@ const SignSearch: React.FC = () => {
                 transition={{ duration: 0.7, delay: 0.3 }}
                 className="w-full max-w-3xl mx-auto mb-10"
               >
-                <div className="relative">
+                <div className="relative" ref={searchBoxRef}>
                   <Input
                     type="text"
+                    role="searchbox"
+                    enterKeyHint="search"
+                    autoComplete="off"
                     placeholder="Search for a sign (e.g., Hello, Thank you, Bird...)"
-                    className="w-full py-6 px-5 bg-white/5 border-white/10 text-white placeholder:text-white/40 rounded-xl shadow-lg focus-visible:ring-indigo-500 focus-visible:border-indigo-500 transition-colors duration:300"
+                    aria-label="Search signs"
+                    className="w-full py-6 pl-5 pr-24 bg-white/5 border-white/10 text-white placeholder:text-white/40 rounded-xl shadow-lg focus-visible:ring-indigo-500 focus-visible:border-indigo-500 transition-colors duration-300"
                     value={searchQuery}
-                    onChange={handleInputChange}
+                    onChange={(event) => updateQuery(event.target.value, true)}
+                    onFocus={() => searchQuery && setShowDropdown(true)}
+                    onKeyDown={(event) => {
+                      if (event.key === "Escape") setShowDropdown(false);
+                      if (event.key === "Enter" && filteredSigns.length > 0) openSign(filteredSigns[0]);
+                    }}
                   />
                   {searchQuery && (
                     <Button
@@ -415,28 +434,24 @@ const SignSearch: React.FC = () => {
                   <div className="absolute right-4 top-1/2 transform -translate-y-1/2 text-white/40 pointer-events-none">
                     <FaSearch className="text-lg" />
                   </div>
-                  {/* Improve the dropdown suggestions to make them more interactive */}
                   {searchQuery && showDropdown && (
-                    <div className="absolute left-0 right-0 mt-2 rounded-md shadow-lg bg-black/70 backdrop-blur-md border border-white/10 overflow-hidden z-50">
+                    <div className="absolute left-0 right-0 mt-2 rounded-md shadow-lg bg-black/80 backdrop-blur-md border border-white/10 overflow-hidden z-50">
                       {filteredSigns.length > 0 ? (
                         filteredSigns.slice(0, 5).map((sign) => (
                           <Button
                             key={sign.index}
+                            type="button"
                             variant="ghost"
                             className="w-full text-left px-4 py-2 text-white hover:bg-indigo-500/30 justify-start"
-                            onClick={() => {
-                              handleSignClick(sign.index);
-                              setShowDropdown(false);
-                              // Focus on the sign in the table by scrolling to it
-                              document.getElementById(`sign-row-${sign.index}`)?.scrollIntoView({
-                                behavior: 'smooth',
-                                block: 'center'
-                              });
-                            }}
+                            onClick={() => openSign(sign)}
                           >
-                            <div className="flex items-center gap-2">
-                              <FaPlayCircle className="text-indigo-400" />
-                              {sign.name}
+                            <div className="flex items-center gap-2 capitalize">
+                              {sign.hasVideo ? (
+                                <FaPlayCircle className="text-indigo-400" />
+                              ) : (
+                                <FaVideoSlash className="text-white/30" />
+                              )}
+                              {formatSignName(sign.name)}
                             </div>
                           </Button>
                         ))
@@ -450,7 +465,7 @@ const SignSearch: React.FC = () => {
 
               {/* Search Results */}
               <div className="w-full max-w-3xl mx-auto">
-                {searchQuery && (
+                {searchQuery.trim() && (
                   <>
                     <motion.h2
                       initial={{ opacity: 0 }}
@@ -462,65 +477,54 @@ const SignSearch: React.FC = () => {
                         : 'No results found'}
                     </motion.h2>
 
-                    <div className="bg-white/[0.03] backdrop-blur-md border border-white/10 rounded-2xl p-6 shadow-xl min-h-[300px]">
+                    <div className="bg-white/[0.03] backdrop-blur-md border border-white/10 rounded-2xl p-4 sm:p-6 shadow-xl min-h-[300px]">
                       {currentSigns.length > 0 ? (
                         <Table>
-                          <TableCaption>A list of your recent invoices.</TableCaption>
                           <TableHeader>
-                            <TableRow>
-                              <TableHead className="w-[100px] text-white font-semibold text-lg">Index</TableHead>
+                            <TableRow className="border-white/10 hover:bg-transparent">
+                              <TableHead className="w-[80px] text-white font-semibold text-lg">#</TableHead>
                               <TableHead className="text-white font-semibold text-lg">Sign Name</TableHead>
                             </TableRow>
                           </TableHeader>
                           <TableBody>
-  {currentSigns.map((sign) => (
-    <TableRow key={sign.index} id={`sign-row-${sign.index}`} className="hover:bg-white/5 cursor-pointer transition-colors">
-      <TableCell className="font-medium text-white text-lg">{sign.index}</TableCell>
-      <TableCell>
-        <Dialog>
-          <DialogTrigger asChild>
-            <Button 
-              variant="link" 
-              className="text-indigo-400 hover:text-indigo-500 font-semibold text-lg flex items-center gap-2"
-              onClick={() => handleSignClick(sign.index)}
-            >
-              <FaPlayCircle className="text-sm" />
-              {sign.name}
-            </Button>
-          </DialogTrigger>
-          <DialogContent className="sm:max-w-[600px] bg-black border border-white/10">
-            <DialogHeader>
-              <DialogTitle className="text-white font-semibold text-2xl">{sign.name}</DialogTitle>
-              <DialogDescription className="text-white/80 text-lg">
-                Watch the video of {sign.name}
-              </DialogDescription>
-            </DialogHeader>
-            <video
-              ref={videoRef}
-              width="560"
-              height="315"
-              controls
-              autoPlay
-              muted
-              loop
-              className="mx-auto rounded-md shadow-lg"
-            >
-              <source src={`/videos/signs/${sign.index}.mp4`} type="video/mp4" />
-              Your browser does not support the video tag.
-            </video>
-          </DialogContent>
-        </Dialog>
-      </TableCell>
-    </TableRow>
-  ))}
-</TableBody>
+                            {currentSigns.map((sign) => (
+                              <TableRow
+                                key={sign.index}
+                                className="border-white/10 hover:bg-white/5 cursor-pointer transition-colors"
+                                onClick={() => openSign(sign)}
+                              >
+                                <TableCell className="font-medium text-white/70 text-lg tabular-nums">{sign.index}</TableCell>
+                                <TableCell>
+                                  <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+                                    <Button
+                                      type="button"
+                                      variant="link"
+                                      className="h-auto p-0 text-indigo-400 hover:text-indigo-300 font-semibold text-lg flex items-center gap-2 capitalize"
+                                      onClick={(event) => {
+                                        event.stopPropagation();
+                                        openSign(sign);
+                                      }}
+                                    >
+                                      <FaPlayCircle className="text-sm" />
+                                      {formatSignName(sign.name)}
+                                    </Button>
+                                    {!sign.hasVideo && (
+                                      <span className="text-xs text-white/40 px-2 py-0.5 rounded-full border border-white/10">
+                                        Video coming soon
+                                      </span>
+                                    )}
+                                  </div>
+                                </TableCell>
+                              </TableRow>
+                            ))}
+                          </TableBody>
                         </Table>
-                      ) : searchQuery && (
+                      ) : (
                         <div className="flex flex-col items-center justify-center h-[300px]">
                           <div className="text-5xl mb-4 text-white/30">🔍</div>
                           <h3 className="text-xl font-medium text-white/70 mb-2">No matches found</h3>
-                          <p className="text-white/50 text-center max-w-md">
-                            Sorry, we couldn't find any signs matching "{searchQuery}".
+                          <p className="text-white/50 text-center max-w-md break-words">
+                            Sorry, we couldn&apos;t find any signs matching &quot;{searchQuery}&quot;.
                             Try a different search term or check your spelling.
                           </p>
                         </div>
@@ -529,7 +533,7 @@ const SignSearch: React.FC = () => {
                   </>
                 )}
 
-                {!searchQuery && (
+                {!searchQuery.trim() && (
                   <div className="bg-white/[0.03] backdrop-blur-md border border-white/10 rounded-2xl p-8 text-center shadow-xl">
                     <div className="flex flex-col items-center justify-center py-8">
                       <div className="w-20 h-20 rounded-full bg-gradient-to-br from-indigo-500/20 to-rose-500/20 flex items-center justify-center mb-6">
@@ -540,11 +544,12 @@ const SignSearch: React.FC = () => {
                         Type the name of a sign above to find video tutorials and improve your sign language skills.
                       </p>
                       <div className="grid gap-2 grid-cols-2 sm:grid-cols-3 md:grid-cols-4 max-w-xl">
-                        {["Hello", "Thank", "Bird", "Apple", "Happy", "Boy", "Girl", "Home", "Donkey"].map((suggestion, i) => (
+                        {SUGGESTIONS.map((suggestion) => (
                           <Button
                             key={suggestion}
+                            type="button"
                             variant="outline"
-                            onClick={() => setSearchQuery(suggestion)}
+                            onClick={() => updateQuery(suggestion, false)}
                             className="bg-white/5 hover:bg-white/10 border-white/10 text-white/80"
                           >
                             {suggestion}
@@ -555,37 +560,104 @@ const SignSearch: React.FC = () => {
                   </div>
                 )}
               </div>
-              {filteredSigns.length > 0 && (
-                <Pagination>
-                  <PaginationContent>
-                    {currentPage > 1 && (
-                      <PaginationPrevious
-                        href="#"
-                        onClick={() => setCurrentPage(currentPage - 1)}
-                      />
-                    )}
-                    {Array.from({ length: totalPages }, (_, i) => i + 1).map((page) => (
-                      <PaginationItem
-                        key={page}
-                        className={cn({ "active-class": currentPage === page })}
-                      >
-                        <PaginationLink
+              {totalPages > 1 && (
+                <Pagination className="mt-6">
+                  <PaginationContent className="flex-wrap justify-center text-white">
+                    {page > 1 && (
+                      <PaginationItem>
+                        <PaginationPrevious
                           href="#"
-                          onClick={() => setCurrentPage(page)}
-                        >
-                          {page}
-                        </PaginationLink>
+                          className="hover:bg-white/10 hover:text-white"
+                          onClick={(event) => goToPage(event, page - 1)}
+                        />
                       </PaginationItem>
-                    ))}
-                    {currentPage < totalPages && (
-                      <PaginationNext
-                        href="#"
-                        onClick={() => setCurrentPage(currentPage + 1)}
-                      />
+                    )}
+                    {visiblePages(page, totalPages).map((pageNumber, i) =>
+                      pageNumber === null ? (
+                        <PaginationItem key={`gap-${i}`}>
+                          <PaginationEllipsis />
+                        </PaginationItem>
+                      ) : (
+                        <PaginationItem key={pageNumber}>
+                          <PaginationLink
+                            href="#"
+                            isActive={pageNumber === page}
+                            className={cn(
+                              "hover:bg-white/10 hover:text-white",
+                              pageNumber === page && "bg-white/10 border-white/20 text-white"
+                            )}
+                            onClick={(event) => goToPage(event, pageNumber)}
+                          >
+                            {pageNumber}
+                          </PaginationLink>
+                        </PaginationItem>
+                      )
+                    )}
+                    {page < totalPages && (
+                      <PaginationItem>
+                        <PaginationNext
+                          href="#"
+                          className="hover:bg-white/10 hover:text-white"
+                          onClick={(event) => goToPage(event, page + 1)}
+                        />
+                      </PaginationItem>
                     )}
                   </PaginationContent>
                 </Pagination>
               )}
+
+              <Dialog
+                open={selectedSign !== null}
+                onOpenChange={(open) => {
+                  if (!open) setSelectedSign(null);
+                }}
+              >
+                <DialogContent className="w-[calc(100vw-2rem)] sm:max-w-[600px] bg-black border border-white/10 text-white font-serif">
+                  {selectedSign && (
+                    <>
+                      <DialogHeader>
+                        <DialogTitle className="text-white font-semibold text-2xl capitalize">
+                          {formatSignName(selectedSign.name)}
+                        </DialogTitle>
+                        <DialogDescription className="text-white/80 text-lg">
+                          {selectedSign.hasVideo && !videoFailed
+                            ? `Watch how to sign "${formatSignName(selectedSign.name)}"`
+                            : "A demonstration video for this sign is not available yet."}
+                        </DialogDescription>
+                      </DialogHeader>
+                      {selectedSign.hasVideo && !videoFailed ? (
+                        <video
+                          key={selectedSign.index}
+                          src={`/videos/signs/${selectedSign.index}.mp4`}
+                          controls
+                          autoPlay
+                          muted
+                          loop
+                          playsInline
+                          preload="auto"
+                          onError={() => setVideoFailed(true)}
+                          className="w-full aspect-video mx-auto rounded-md shadow-lg bg-white/5"
+                        >
+                          Your browser does not support the video tag.
+                        </video>
+                      ) : (
+                        <div className="w-full aspect-video rounded-md border border-white/10 bg-white/[0.03] flex flex-col items-center justify-center gap-3 text-center p-6">
+                          <FaVideoSlash className="text-3xl text-white/40" />
+                          <p className="text-white/60 text-sm max-w-xs">
+                            You can still try it on the detection page: the model recognizes this sign.
+                          </p>
+                          <Link
+                            href="/sign-detection"
+                            className="inline-flex items-center gap-2 text-sm text-indigo-300 hover:text-indigo-200"
+                          >
+                            Go to detection <FaArrowRight className="text-xs" />
+                          </Link>
+                        </div>
+                      )}
+                    </>
+                  )}
+                </DialogContent>
+              </Dialog>
 
               {/* Additional info section */}
               <motion.div
