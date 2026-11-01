@@ -1,155 +1,49 @@
-"use client";
-
-import PixelCard from "@/components/PixelCard"; // Import the new PixelCard component
+import PixelCard from "@/components/PixelCard";
 import Background from "@/components/background";
 import { Button } from "@/components/ui/button";
 import { Slider } from "@/components/ui/slider";
+import { SLOW_FRAME_MS, useHolisticTracker, type TrackerStatus } from "@/hooks/useHolisticTracker";
+import {
+  PredictionError,
+  requestPrediction,
+  warmBackend,
+  type PredictionResponse,
+  type SignPrediction,
+} from "@/lib/api";
+import { packFrames, type LandmarkFrame } from "@/lib/holistic";
 import { cn } from "@/lib/utils";
-import { cva, type VariantProps } from "class-variance-authority";
 import { motion } from "framer-motion";
+import type { NormalizedLandmarkList } from "@mediapipe/holistic";
+import Head from "next/head";
 import Image from "next/image";
 import Link from "next/link";
 import * as React from "react";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { FaArrowRight, FaCamera, FaHandPaper, FaStop } from "react-icons/fa";
+import { FaArrowRight, FaCamera, FaExclamationTriangle, FaHandPaper, FaStop } from "react-icons/fa";
 import { IoRefreshOutline, IoVolumeHigh } from "react-icons/io5";
 import Webcam from "react-webcam";
 
-// Fix the Alert components code
-const alertVariants = cva("relative rounded-lg border", {
-  variants: {
-    variant: {
-      default: "border-border bg-background",
-      warning: "border-amber-500/50 text-amber-600",
-      error: "border-red-500/50 text-red-600",
-      success: "border-emerald-500/50",
-      info: "border-blue-500/50 text-blue-600",
-    },
-    size: {
-      sm: "px-4 py-3",
-      lg: "p-4",
-    },
-    isNotification: {
-      true: "z-[100] max-w-[400px] bg-background shadow-lg shadow-black/5",
-      false: "",
-    },
-  },
-  defaultVariants: {
-    variant: "default",
-    size: "sm",
-    isNotification: false,
-  },
-});
-
-interface AlertProps
-  extends React.HTMLAttributes<HTMLDivElement>,
-    VariantProps<typeof alertVariants> {
-  icon?: React.ReactNode;
-  action?: React.ReactNode;
-  layout?: "row" | "complex";
-}
-
-const Alert = React.forwardRef<HTMLDivElement, AlertProps>(
-  (
-    {
-      className,
-      variant,
-      size,
-      isNotification,
-      icon,
-      action,
-      layout = "row",
-      children,
-      ...props
-    },
-    ref
-  ) => (
-    <div
-      ref={ref}
-      role="alert"
-      className={cn(
-        alertVariants({ variant, size, isNotification }),
-        className
-      )}
-      {...props}
-    >
-      {layout === "row" ? (
-        // Однострочный вариант
-        <div className="flex items-center gap-2">
-          <div className="grow flex items-center">
-            {icon && <span className="me-3 inline-flex">{icon}</span>}
-            {children}
-          </div>
-          {action && <div className="flex items-center shrink-0">{action}</div>}
-        </div>
-      ) : (
-        // Многострочный вариант
-        <div className="flex gap-2">
-          {icon && children ? (
-            <div className="flex grow gap-3">
-              <span className="mt-0.5 shrink-0">{icon}</span>
-              <div className="grow">{children}</div>
-            </div>
-          ) : (
-            <div className="grow">
-              {icon && <span className="me-3 inline-flex">{icon}</span>}
-              {children}
-            </div>
-          )}
-          {action && <div className="shrink-0">{action}</div>}
-        </div>
-      )}
-    </div>
-  )
-);
-Alert.displayName = "Alert";
-
-const AlertTitle = React.forwardRef<
-  HTMLParagraphElement,
-  React.HTMLAttributes<HTMLHeadingElement>
->(({ className, ...props }, ref) => (
-  <h5 ref={ref} className={cn("text-sm font-medium", className)} {...props} />
-));
-AlertTitle.displayName = "AlertTitle";
-
-const AlertDescription = React.forwardRef<
-  HTMLParagraphElement,
-  React.HTMLAttributes<HTMLParagraphElement>
->(({ className, ...props }, ref) => (
-  <div
-    ref={ref}
-    className={cn("text-sm text-muted-foreground", className)}
-    {...props}
-  />
-));
-AlertDescription.displayName = "AlertDescription";
-
-const AlertContent = React.forwardRef<
-  HTMLDivElement,
-  React.HTMLAttributes<HTMLDivElement>
->(({ className, ...props }, ref) => (
-  <div ref={ref} className={cn("space-y-1", className)} {...props} />
-));
-AlertContent.displayName = "AlertContent";
-
-export { Alert, AlertContent, AlertDescription, AlertTitle };
-
 const pacifico = { className: "font-serif", variable: "font-serif" };
 const inter = { variable: "font-sans" };
-const API_BASE_URL =
-  process.env.NEXT_PUBLIC_API_BASE_URL?.replace(/\/$/, "") ||
-  "http://localhost:5000";
-// A warm prediction normally finishes in a few seconds.  This still leaves room
-// for a Render cold start, without leaving the result screen stuck for 3 minutes.
-const PREDICTION_TIMEOUT_MS = 75_000;
-const BACKEND_WARMUP_TIMEOUT_MS = 60_000;
+
+// On-device predictions only upload landmarks and return in well under a
+// second; this budget is for a Render cold start or the video fallback.
+const PREDICTION_TIMEOUT_MS = 90_000;
+const DEFAULT_RECORDING_DURATION = 3;
+const MIN_RECORDING_DURATION = 1;
 const MAX_RECORDING_DURATION = 10;
+// Matches MAX_LANDMARK_FRAMES on the backend (30 fps for 10 seconds, doubled).
+const MAX_LANDMARK_FRAMES = 600;
+// Fewer hand frames than this is not enough motion for the model.
+const MIN_HAND_FRAMES = 4;
+// Below this tracking rate (slow GPU / software rendering) the on-device
+// sequence is too sparse, so the recorded clip is sent to the server instead.
+const MIN_TRACKED_FPS = 6;
+const LOW_CONFIDENCE = 0.25;
 const VIDEO_CONSTRAINTS: MediaTrackConstraints = {
-  width: { ideal: 640, max: 640 },
-  height: { ideal: 480, max: 480 },
-  // The old 15 fps cap made this page visibly less fluid than the rest of the
-  // app. Let the camera preview use its normal smooth cadence.
-  frameRate: { ideal: 24, max: 30 },
+  width: { ideal: 640 },
+  height: { ideal: 480 },
+  frameRate: { ideal: 30, max: 30 },
   facingMode: "user",
 };
 const RECORDER_MIME_TYPES = [
@@ -157,19 +51,166 @@ const RECORDER_MIME_TYPES = [
   "video/webm",
   "video/mp4",
 ];
-// A modest bitrate keeps MediaRecorder from competing with the live preview
-// (or an OS screen recorder) for encoder resources.
-const RECORDING_BITS_PER_SECOND = 250_000;
+// A modest bitrate keeps MediaRecorder from competing with hand tracking and
+// the live preview for CPU and encoder resources.
+const RECORDING_BITS_PER_SECOND = 600_000;
 const WELCOME_SPEECH_SESSION_KEY = "welcomeMessagePlayed";
+const WELCOME_MESSAGE =
+  "Welcome to SignEase! To start sign language detection, position yourself clearly in the camera view, adjust the recording duration using the slider if needed, and click the Start Recording button. For best results, ensure good lighting and perform clear, deliberate gestures.";
+
+const HAND_CONNECTIONS: ReadonlyArray<[number, number]> = [
+  [0, 1], [1, 2], [2, 3], [3, 4],
+  [0, 5], [5, 6], [6, 7], [7, 8],
+  [5, 9], [9, 10], [10, 11], [11, 12],
+  [9, 13], [13, 14], [14, 15], [15, 16],
+  [13, 17], [0, 17], [17, 18], [18, 19], [19, 20],
+];
+
+type Phase = "idle" | "recording" | "processing" | "result" | "error";
+type PredictionMode = "on-device" | "server";
+
+interface RecognitionResult {
+  sign: string;
+  confidence: number;
+  alternatives: SignPrediction[];
+  mode: PredictionMode;
+}
+
+interface RecordingSession {
+  active: boolean;
+  startedAt: number;
+  handFrames: Float32Array[];
+  trackedFrames: number;
+  trackerFailed: boolean;
+  trackerTooSlow: boolean;
+  trackingLoop: Promise<void> | null;
+  recorder: MediaRecorder | null;
+  recorderStopped: Promise<Blob | null> | null;
+  stopTimer: number | null;
+  abort: AbortController;
+}
 
 function getSupportedRecordingMimeType() {
-  return RECORDER_MIME_TYPES.find((mimeType) =>
-    typeof MediaRecorder !== "undefined" && MediaRecorder.isTypeSupported(mimeType)
-  );
+  if (typeof MediaRecorder === "undefined") return undefined;
+  return RECORDER_MIME_TYPES.find((mimeType) => MediaRecorder.isTypeSupported(mimeType));
 }
 
 function getRecordingExtension(mimeType: string) {
   return mimeType.includes("mp4") ? "mp4" : "webm";
+}
+
+function formatSign(sign: string) {
+  return sign.replace(/_/g, " ");
+}
+
+/**
+ * Resolves on the next decoded camera frame (or animation frame as a
+ * fallback). The timeout keeps the loop alive if the camera stalls.
+ */
+function nextVideoFrame(video: HTMLVideoElement) {
+  return new Promise<void>((resolve) => {
+    const timeoutId = window.setTimeout(resolve, 250);
+    const done = () => {
+      window.clearTimeout(timeoutId);
+      resolve();
+    };
+    if ("requestVideoFrameCallback" in video) {
+      video.requestVideoFrameCallback(done);
+    } else {
+      window.requestAnimationFrame(done);
+    }
+  });
+}
+
+function withTimeout<T>(promise: Promise<T> | null, ms: number, fallback: T) {
+  if (!promise) return Promise.resolve(fallback);
+  return Promise.race([
+    promise,
+    new Promise<T>((resolve) => window.setTimeout(() => resolve(fallback), ms)),
+  ]);
+}
+
+function startRecorder(stream: MediaStream) {
+  if (typeof MediaRecorder === "undefined") {
+    return { recorder: null, stopped: null };
+  }
+
+  try {
+    const mimeType = getSupportedRecordingMimeType();
+    const recorder = new MediaRecorder(stream, {
+      ...(mimeType ? { mimeType } : {}),
+      videoBitsPerSecond: RECORDING_BITS_PER_SECOND,
+    });
+    const chunks: Blob[] = [];
+    const stopped = new Promise<Blob | null>((resolve) => {
+      recorder.ondataavailable = (event) => {
+        if (event.data.size > 0) chunks.push(event.data);
+      };
+      recorder.onstop = () => {
+        resolve(chunks.length ? new Blob(chunks, { type: recorder.mimeType || "video/webm" }) : null);
+      };
+      recorder.onerror = () => resolve(null);
+    });
+    recorder.start();
+    return { recorder, stopped };
+  } catch (error) {
+    console.warn("[SignEase] MediaRecorder unavailable", error);
+    return { recorder: null, stopped: null };
+  }
+}
+
+function drawHands(
+  canvas: HTMLCanvasElement | null,
+  video: HTMLVideoElement,
+  hands: Array<NormalizedLandmarkList | undefined>
+) {
+  if (!canvas) return;
+  const context = canvas.getContext("2d");
+  if (!context) return;
+
+  if (canvas.width !== video.videoWidth || canvas.height !== video.videoHeight) {
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+  }
+  context.clearRect(0, 0, canvas.width, canvas.height);
+
+  const scale = Math.max(2, canvas.width / 320);
+  for (const hand of hands) {
+    if (!hand?.length) continue;
+
+    context.strokeStyle = "rgba(165, 180, 252, 0.9)";
+    context.lineWidth = scale;
+    context.beginPath();
+    for (const [from, to] of HAND_CONNECTIONS) {
+      context.moveTo(hand[from].x * canvas.width, hand[from].y * canvas.height);
+      context.lineTo(hand[to].x * canvas.width, hand[to].y * canvas.height);
+    }
+    context.stroke();
+
+    context.fillStyle = "rgba(251, 113, 133, 0.95)";
+    for (const point of hand) {
+      context.beginPath();
+      context.arc(point.x * canvas.width, point.y * canvas.height, scale * 1.5, 0, Math.PI * 2);
+      context.fill();
+    }
+  }
+}
+
+function clearCanvas(canvas: HTMLCanvasElement | null) {
+  canvas?.getContext("2d")?.clearRect(0, 0, canvas.width, canvas.height);
+}
+
+function trackerLabel(status: TrackerStatus) {
+  switch (status) {
+    case "loading":
+      return "Loading on-device hand tracking…";
+    case "calibrating":
+      return "Checking device performance…";
+    case "ready":
+      return "On-device hand tracking ready";
+    default:
+      return "Server processing mode";
+  }
 }
 
 // Add elegant shapes for visual consistency with home page
@@ -239,120 +280,75 @@ function ElegantShape({
   );
 }
 
-interface SignDetectionProps {
-  // Add any props if needed
-}
-
-const SignDetection: React.FC<SignDetectionProps> = React.memo(() => {
-  // Add mounted state
-  const [mounted, setMounted] = useState(false);
-
-  // State management
+const SignDetection: React.FC = () => {
   const webcamRef = useRef<Webcam>(null);
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const [videoChunks, setVideoChunks] = useState<Blob[]>([]);
-  // Three seconds gives the recognition model enough motion to distinguish
-  // dynamic signs without making the interaction feel slow.
-  const [duration, setDuration] = useState<number>(3);
-  const [prediction, setPrediction] = useState<string>("No sign detected");
-  const [isDetecting, setIsDetecting] = useState<boolean>(false);
-  const [timer, setTimer] = useState<number>(0);
-  const [confidence, setConfidence] = useState<number>(0);
-  const [capturing, setCapturing] = useState<boolean>(false);
-  const [darkMode, setDarkMode] = useState<boolean>(
-    typeof window !== "undefined" && localStorage.getItem("darkMode") === "true"
-  );
-  // Add state for welcome speech
+  const overlayRef = useRef<HTMLCanvasElement>(null);
+  const sessionRef = useRef<RecordingSession | null>(null);
+  const mountedRef = useRef(true);
+  const { status: trackerStatus, trackerRef, calibrate, disable: disableTracker } = useHolisticTracker();
+
+  const [duration, setDuration] = useState<number>(DEFAULT_RECORDING_DURATION);
+  const [phase, setPhase] = useState<Phase>("idle");
+  const [elapsed, setElapsed] = useState<number>(0);
+  const [handsVisible, setHandsVisible] = useState<boolean>(false);
+  const [result, setResult] = useState<RecognitionResult | null>(null);
+  const [errorMessage, setErrorMessage] = useState<string>("");
+  const [cameraReady, setCameraReady] = useState<boolean>(false);
+  const [cameraError, setCameraError] = useState<string>("");
+  const [cameraKey, setCameraKey] = useState<number>(0);
+
+  // Speech state
   const [hasPlayedWelcome, setHasPlayedWelcome] = useState<boolean>(false);
   const [isSpeaking, setIsSpeaking] = useState<boolean>(false);
-  const speechSynthesisRef = useRef<SpeechSynthesis | null>(null);
-  const welcomeSpeechAttemptedRef = useRef(false);
-  // Add state to track voice loading and initial prompt
   const [voicesLoaded, setVoicesLoaded] = useState<boolean>(false);
   const [speechBlocked, setSpeechBlocked] = useState<boolean>(false);
-  // Remove the debug message state that was visible to users
-  const [debugMessageInternal, setDebugMessageInternal] = useState<string>('');
-  
-  // Prevent hydration errors
-  const [isClient, setIsClient] = useState(false);
+  const speechSynthesisRef = useRef<SpeechSynthesis | null>(null);
+  const welcomeSpeechAttemptedRef = useRef(false);
+
+  const isRecording = phase === "recording";
+  const isBusy = phase === "recording" || phase === "processing";
+
   useEffect(() => {
-    setIsClient(true);
-    
-    // Initialize speech synthesis
-    if (typeof window !== 'undefined' && window.speechSynthesis) {
+    mountedRef.current = true;
+    if (typeof window !== "undefined" && window.speechSynthesis) {
       speechSynthesisRef.current = window.speechSynthesis;
-      console.log("Speech synthesis initialized");
-    } else {
-      console.warn("Speech synthesis not available");
     }
-  }, []);
-
-  // Handle mounting
-  useEffect(() => {
-    setMounted(true);
-  }, []);
-
-  // Load the model while the user is setting up their recording. This avoids
-  // making the first prediction wait for a cold Render ML initialization.
-  useEffect(() => {
-    const controller = new AbortController();
-    const timeoutId = window.setTimeout(
-      () => controller.abort(),
-      BACKEND_WARMUP_TIMEOUT_MS
-    );
-
-    void fetch(`${API_BASE_URL}/warmup`, { signal: controller.signal })
-      .then(async (response) => {
-        if (!response.ok) {
-          throw new Error(`Model warmup failed (${response.status})`);
-        }
-        const data = await response.json();
-        console.info("[SignEase] Prediction model is ready", {
-          url: API_BASE_URL,
-          warmupSeconds: data.warmup_seconds,
-        });
-      })
-      .catch((error: unknown) => {
-        console.warn("[SignEase] Prediction model warmup failed", {
-          url: API_BASE_URL,
-          error: error instanceof Error ? error.message : error,
-        });
-      })
-      .finally(() => window.clearTimeout(timeoutId));
 
     return () => {
-      window.clearTimeout(timeoutId);
-      controller.abort();
+      mountedRef.current = false;
     };
+  }, []);
+
+  // Wake the backend while the user is setting up, so the first prediction
+  // does not wait for a cold Render start.
+  useEffect(() => {
+    void warmBackend();
   }, []);
 
   // Get voices and check if they're available
   useEffect(() => {
-    if (speechSynthesisRef.current) {
-      // Get initial voices - might be empty array in some browsers
-      const initialVoices = speechSynthesisRef.current.getVoices();
-      
-      if (initialVoices.length > 0) {
-        console.log(`Initial voices available: ${initialVoices.length}`);
-        setVoicesLoaded(true);
-      }
-      
-      // Set up voices changed event handler
-      const handleVoicesChanged = () => {
-        const voices = speechSynthesisRef.current?.getVoices() || [];
-        console.log(`Voices loaded: ${voices.length}`);
-        setVoicesLoaded(true);
-      };
-      
-      speechSynthesisRef.current.onvoiceschanged = handleVoicesChanged;
+    const synth = speechSynthesisRef.current;
+    if (!synth) return;
+
+    if (synth.getVoices().length > 0) {
+      setVoicesLoaded(true);
     }
+
+    const handleVoicesChanged = () => setVoicesLoaded(true);
+    synth.addEventListener?.("voiceschanged", handleVoicesChanged);
+    // Some browsers never fire voiceschanged; try anyway after a short wait.
+    const fallbackId = window.setTimeout(() => setVoicesLoaded(true), 1500);
+
+    return () => {
+      synth.removeEventListener?.("voiceschanged", handleVoicesChanged);
+      window.clearTimeout(fallbackId);
+    };
   }, []);
 
-  // Welcome speech function with improved debugging and reliability
   const getPreferredVoice = useCallback(() => {
     const voices = speechSynthesisRef.current?.getVoices() || [];
     const englishVoices = voices.filter(
-      (voice) => voice.lang.includes("en") || voice.name.includes("English")
+      (voice) => voice.lang.toLowerCase().startsWith("en") || voice.name.includes("English")
     );
     const femaleVoice = englishVoices.find(
       (voice) =>
@@ -364,362 +360,370 @@ const SignDetection: React.FC<SignDetectionProps> = React.memo(() => {
     return femaleVoice || englishVoices[0] || voices[0] || null;
   }, []);
 
-  const speakWelcomeMessage = useCallback((force = false) => {
-    // Don't try to speak if we've already done it or if speech synthesis isn't available
-    if (
-      (!force && (hasPlayedWelcome || welcomeSpeechAttemptedRef.current)) ||
-      !speechSynthesisRef.current ||
-      !('speechSynthesis' in window)
-    ) {
-      return;
-    }
+  const speak = useCallback(
+    (text: string, { onStart, onEnd }: { onStart?: () => void; onEnd?: (ok: boolean) => void } = {}) => {
+      const synth = speechSynthesisRef.current;
+      if (!synth) return false;
 
-    try {
-      // Keep automatic instructions to one attempt per browser tab. Mark this
-      // before speaking because route changes and browser interruptions can
-      // cancel an utterance before its `onend` event fires.
-      const hasPlayed = sessionStorage.getItem(WELCOME_SPEECH_SESSION_KEY);
-      if (hasPlayed && !force) {
-        setHasPlayedWelcome(true);
+      try {
+        synth.cancel();
+        const utterance = new SpeechSynthesisUtterance(text);
+        utterance.rate = 1;
+        utterance.pitch = 1;
+        utterance.volume = 1;
+        const preferredVoice = getPreferredVoice();
+        if (preferredVoice) utterance.voice = preferredVoice;
+
+        utterance.onstart = () => {
+          setIsSpeaking(true);
+          onStart?.();
+        };
+        utterance.onend = () => {
+          setIsSpeaking(false);
+          onEnd?.(true);
+        };
+        utterance.onerror = () => {
+          setIsSpeaking(false);
+          onEnd?.(false);
+        };
+        synth.speak(utterance);
+        return true;
+      } catch (error) {
+        console.error("Speech error:", error);
+        setIsSpeaking(false);
+        return false;
+      }
+    },
+    [getPreferredVoice]
+  );
+
+  const speakWelcomeMessage = useCallback(
+    (force = false) => {
+      const synth = speechSynthesisRef.current;
+      if (!synth || (!force && (hasPlayedWelcome || welcomeSpeechAttemptedRef.current))) {
         return;
       }
 
-      if (!force) {
-        welcomeSpeechAttemptedRef.current = true;
-        sessionStorage.setItem(WELCOME_SPEECH_SESSION_KEY, 'true');
-        setHasPlayedWelcome(true);
+      try {
+        // Keep automatic instructions to one attempt per browser tab. Mark
+        // this before speaking because route changes and browser
+        // interruptions can cancel an utterance before `onend` fires.
+        if (!force) {
+          welcomeSpeechAttemptedRef.current = true;
+          if (sessionStorage.getItem(WELCOME_SPEECH_SESSION_KEY)) {
+            setHasPlayedWelcome(true);
+            return;
+          }
+          sessionStorage.setItem(WELCOME_SPEECH_SESSION_KEY, "true");
+        }
+      } catch {
+        // sessionStorage can throw in private mode; speaking still works.
       }
 
-      // Cancel any existing speech
-      speechSynthesisRef.current.cancel();
-      
-      // Create welcome message with instructions
-      const welcomeMessage = new SpeechSynthesisUtterance(
-        "Welcome to SignEase! To start sign language detection, position yourself clearly in the camera view, adjust the recording duration using the slider if needed, and click the Start Recording button. For best results, ensure good lighting and perform clear, deliberate gestures."
-      );
-      
-      // Configure voice properties
-      welcomeMessage.rate = 1.0; // Normal speed
-      welcomeMessage.pitch = 1.0; // Normal pitch
-      welcomeMessage.volume = 1.0; // Full volume
-      
-      const preferredVoice = getPreferredVoice();
-      if (preferredVoice) {
-        welcomeMessage.voice = preferredVoice;
-      }
-      
-      // Event handlers for speech
-      welcomeMessage.onstart = () => {
-        console.log('Speech started');
-        setIsSpeaking(true);
-        // Only log internally, don't show to user
-        setDebugMessageInternal('Speech in progress...');
-      };
-      
-      welcomeMessage.onend = () => {
-        console.log('Speech ended');
-        setIsSpeaking(false);
-        setHasPlayedWelcome(true);
-        // Only log internally, don't show to user
-        setDebugMessageInternal('Speech completed');
-        sessionStorage.setItem(WELCOME_SPEECH_SESSION_KEY, 'true');
-      };
-      
-      welcomeMessage.onerror = () => {
-        setIsSpeaking(false);
-        setHasPlayedWelcome(true);
+      setHasPlayedWelcome(true);
+      setSpeechBlocked(false);
+      const started = speak(WELCOME_MESSAGE, {
+        onEnd: (ok) => {
+          if (!ok) setSpeechBlocked(true);
+        },
+      });
+      if (!started) {
         setSpeechBlocked(true);
-        // Only log internally, don't show user-facing error messages
-        setDebugMessageInternal(`Speech error occurred`);
-      };
-      
-      // Speak the message
-      setIsSpeaking(true);
-      // Only log internally, don't show to user
-      setDebugMessageInternal('Attempting to speak...');
-      speechSynthesisRef.current.speak(welcomeMessage);
-      
-      // Set a timeout to check if speech actually started
-      setTimeout(() => {
-        if (speechSynthesisRef.current && !speechSynthesisRef.current.speaking) {
+        return;
+      }
+
+      // Autoplay policies drop speech silently; offer a manual button then.
+      window.setTimeout(() => {
+        if (mountedRef.current && !synth.speaking && !synth.pending) {
           setIsSpeaking(false);
           setSpeechBlocked(true);
-          // Only log internally, don't show to user
-          setDebugMessageInternal('Speech may be blocked by browser');
         }
       }, 1000);
-      
-    } catch (error) {
-      setIsSpeaking(false);
-      setSpeechBlocked(true);
-      // Only log internally, don't show to user
-      setDebugMessageInternal(`Speech initialization error`);
-    }
-  }, [getPreferredVoice, hasPlayedWelcome]);
-
-  const speakPrediction = useCallback((sign: string) => {
-    if (
-      !sign ||
-      sign === "Unknown" ||
-      sign === "No sign detected" ||
-      !speechSynthesisRef.current ||
-      !("speechSynthesis" in window)
-    ) {
-      return;
-    }
-
-    try {
-      speechSynthesisRef.current.cancel();
-      const utterance = new SpeechSynthesisUtterance(`Predicted sign is ${sign}`);
-      utterance.rate = 1;
-      utterance.pitch = 1;
-      utterance.volume = 1;
-
-      const preferredVoice = getPreferredVoice();
-      if (preferredVoice) {
-        utterance.voice = preferredVoice;
-      }
-
-      utterance.onstart = () => setIsSpeaking(true);
-      utterance.onend = () => setIsSpeaking(false);
-      utterance.onerror = () => setIsSpeaking(false);
-
-      speechSynthesisRef.current.speak(utterance);
-    } catch (error) {
-      console.error("Prediction speech error:", error);
-      setIsSpeaking(false);
-    }
-  }, [getPreferredVoice]);
+    },
+    [hasPlayedWelcome, speak]
+  );
 
   // Try the intro speech automatically, then fall back to the manual button if blocked.
   useEffect(() => {
-    if (mounted && isClient && voicesLoaded && !hasPlayedWelcome) {
+    if (voicesLoaded && !hasPlayedWelcome) {
       speakWelcomeMessage();
     }
-  }, [mounted, isClient, voicesLoaded, hasPlayedWelcome, speakWelcomeMessage]);
+  }, [voicesLoaded, hasPlayedWelcome, speakWelcomeMessage]);
 
-  // Add a manual interaction handler for browsers that block auto-play audio
   const handleManualSpeech = () => {
     if (speechSynthesisRef.current && !isSpeaking) {
-      // Reset speech flags
-      setSpeechBlocked(false);
-      // Try speaking again
       speakWelcomeMessage(true);
     }
   };
-  
-  // Clean up speech synthesis when component unmounts
-  useEffect(() => {
-    return () => {
-      if (speechSynthesisRef.current) {
-        speechSynthesisRef.current.cancel();
-      }
-    };
-  }, []);
 
-  // Dark Mode Toggle Effect
-  useEffect(() => {
-    if (darkMode) {
-      document.documentElement.classList.add("dark");
-    } else {
-      document.documentElement.classList.remove("dark");
-    }
-    localStorage.setItem("darkMode", darkMode.toString());
-  }, [darkMode]);
-
-  // Timer Logic
-  useEffect(() => {
-    let interval: NodeJS.Timeout;
-    if (isDetecting && timer < duration) {
-      interval = setInterval(() => {
-        setTimer((prev) => {
-          if (prev >= duration) {
-            setIsDetecting(false);
-            stopRecording();
-            return 0;
-          }
-          return prev + 1;
-        });
-      }, 1000);
-    }
-    return () => clearInterval(interval);
-  }, [isDetecting, timer, duration]);
-
-  // Recording functions
-  const startRecording = useCallback(
-    async (e: React.MouseEvent) => {
-      e.preventDefault();
-      if (!webcamRef.current || capturing) return;
-
-      try {
-        const videoElement = webcamRef.current.video;
-        if (!videoElement?.srcObject) return;
-
-        const mimeType = getSupportedRecordingMimeType();
-        const mediaRecorder = new MediaRecorder(videoElement.srcObject as MediaStream, {
-          ...(mimeType ? { mimeType } : {}),
-          videoBitsPerSecond: RECORDING_BITS_PER_SECOND,
-        });
-
-
-        let chunks: Blob[] = [];
-
-        mediaRecorder.ondataavailable = (e) => {
-          if (e.data.size > 0) chunks.push(e.data);
-        };
-
-        mediaRecorder.onstop = () => {
-          setCapturing(false);
-          setIsDetecting(false);
-          setTimer(0);
-          setPrediction("Processing video...");
-          const blob = new Blob(chunks, { type: mediaRecorder.mimeType || "video/webm" });
-          void sendVideoForProcessing(blob);
-          chunks = [];
-        };
-
-        setCapturing(true);
-        setIsDetecting(true);
-        setPrediction("Recording...");
-        setConfidence(0);
-
-        mediaRecorder.start();
-        mediaRecorderRef.current = mediaRecorder;
-
-        setTimeout(() => {
-          if (mediaRecorder.state === "recording") {
-            mediaRecorder.stop();
-          }
-        }, duration * 1000);
-      } catch (error) {
-        console.error("Camera error:", error);
-        setPrediction("Error: Could not access camera");
-        setCapturing(false);
-      }
-    },
-    [capturing, duration]
-  );
-
-  const stopRecording = () => {
-    if (
-      mediaRecorderRef.current &&
-      mediaRecorderRef.current.state === "recording"
-    ) {
-      mediaRecorderRef.current.stop();
-    }
-    setCapturing(false);
+  const skipSpeech = () => {
+    speechSynthesisRef.current?.cancel();
+    setIsSpeaking(false);
+    setHasPlayedWelcome(true);
   };
 
-  const sendVideoForProcessing = React.useCallback(async (videoBlob: Blob) => {
-    try {
-      setPrediction("Processing video...");
-      console.info("[SignEase] Starting prediction request", {
-        url: `${API_BASE_URL}/predict`,
-        videoBytes: videoBlob.size,
-        videoType: videoBlob.type,
-      });
-      const formData = new FormData();
-      const extension = getRecordingExtension(videoBlob.type);
-      formData.append("video", videoBlob, `sign_${Date.now()}.${extension}`);
-      const controller = new AbortController();
-      const timeoutId = setTimeout(
-        () => controller.abort(),
-        PREDICTION_TIMEOUT_MS
-      );
-
-      try {
-        const response = await fetch(`${API_BASE_URL}/predict`, {
-          method: "POST",
-          body: formData,
-          signal: controller.signal,
-          headers: {
-            Accept: "application/json",
-          },
-        });
-
-        const responseText = await response.text();
-        const responseData = responseText ? JSON.parse(responseText) : {};
-
-        if (!response.ok) {
-          throw new Error(
-            responseData.error || `Prediction failed (${response.status})`
-          );
-        }
-
-        if (responseData.timing) {
-          console.info("Prediction timing:", responseData.timing);
-        }
-
-        const detectedSign = responseData.sign || "No sign detected";
-
-        // Batch state updates
-        React.startTransition(() => {
-          setPrediction(detectedSign);
-          setConfidence(
-            responseData.confidence ? responseData.confidence * 100 : 0
-          );
-          setTimer(0);
-          setIsDetecting(false);
-          setCapturing(false);
-        });
-
-        speakPrediction(detectedSign);
-
-      } finally {
-        clearTimeout(timeoutId);
-      }
-    } catch (error: unknown) {
-      console.error("Error:", error);
-      setPrediction(
-        error instanceof Error && error.name === "AbortError"
-          ? "Prediction timed out. Please try again."
-          : error instanceof SyntaxError
-            ? "Server returned an invalid response. Please try again."
-            : error instanceof TypeError
-              ? `Could not reach the prediction server at ${API_BASE_URL}. Make sure the backend is running and reachable.`
-            : error instanceof Error
-              ? error.message
-              : "Error processing video"
-      );
-      setConfidence(0);
-    } finally {
-      setTimer(0);
-      setIsDetecting(false);
-      setCapturing(false);
-    }
-  }, [speakPrediction]);
-
-  // Prevent form submission
-  const handleStartRecording = React.useCallback(
-    (e: React.MouseEvent) => {
-      e.preventDefault();
-      e.stopPropagation();
-
-      // Reset states before starting new recording
-      setTimer(0);
-      setIsDetecting(false);
-      setCapturing(false);
-      setPrediction("Recording...");
-      setConfidence(0);
-
-      if (!capturing) {
-        void startRecording(e);
-      }
-    },
-    [capturing, startRecording]
-  );
-
-  // Cleanup function
+  // Stop speech, recording and in-flight requests when leaving the page.
   useEffect(() => {
     return () => {
-      if (
-        mediaRecorderRef.current &&
-        mediaRecorderRef.current.state === "recording"
-      ) {
-        mediaRecorderRef.current.stop();
+      speechSynthesisRef.current?.cancel();
+      const session = sessionRef.current;
+      if (session) {
+        session.active = false;
+        session.abort.abort();
+        if (session.stopTimer) window.clearTimeout(session.stopTimer);
+        if (session.recorder?.state === "recording") session.recorder.stop();
       }
     };
   }, []);
+
+  // Recording timer, driven from the start timestamp so it cannot drift.
+  useEffect(() => {
+    if (!isRecording) return;
+    const intervalId = window.setInterval(() => {
+      const session = sessionRef.current;
+      if (session) setElapsed((performance.now() - session.startedAt) / 1000);
+    }, 100);
+    return () => window.clearInterval(intervalId);
+  }, [isRecording]);
+
+  // Once both the tracker and camera are up, check this device can track in
+  // real time (and compile the GPU shaders before the first recording).
+  useEffect(() => {
+    const video = webcamRef.current?.video;
+    if (trackerStatus !== "calibrating" || !cameraReady || !video) return;
+
+    const run = () => void calibrate(video);
+    if (video.readyState >= 2) {
+      run();
+      return;
+    }
+    video.addEventListener("loadeddata", run, { once: true });
+    return () => video.removeEventListener("loadeddata", run);
+  }, [calibrate, cameraReady, trackerStatus]);
+
+  const showError = useCallback((message: string) => {
+    if (!mountedRef.current) return;
+    setResult(null);
+    setErrorMessage(message);
+    setPhase("error");
+  }, []);
+
+  const runTrackingLoop = useCallback(
+    async (session: RecordingSession, video: HTMLVideoElement) => {
+      const tracker = trackerRef.current;
+      if (!tracker) return;
+
+      tracker.reset();
+      let slowFrames = 0;
+      while (session.active) {
+        await nextVideoFrame(video);
+        if (!session.active) break;
+
+        let frame: LandmarkFrame | null;
+        const startedAt = performance.now();
+        try {
+          frame = await tracker.process(video);
+        } catch (error) {
+          console.warn("[SignEase] Hand tracking failed during recording", error);
+          session.trackerFailed = true;
+          disableTracker("hand tracking failed during recording");
+          break;
+        }
+
+        // Stop tracking if the device cannot keep up (e.g. thermal
+        // throttling), so the preview and the recorder stay smooth.
+        slowFrames = performance.now() - startedAt > SLOW_FRAME_MS * 2 ? slowFrames + 1 : 0;
+        if (slowFrames >= 3) {
+          session.trackerTooSlow = true;
+          disableTracker("hand tracking slowed down during recording");
+          break;
+        }
+        if (!frame || !session.active) continue;
+
+        session.trackedFrames += 1;
+        if (frame.hasHands && session.handFrames.length < MAX_LANDMARK_FRAMES) {
+          session.handFrames.push(frame.values);
+        }
+        if (mountedRef.current) {
+          setHandsVisible(frame.hasHands);
+          drawHands(overlayRef.current, video, [frame.leftHand, frame.rightHand]);
+        }
+      }
+    },
+    [disableTracker, trackerRef]
+  );
+
+  const finishRecording = useCallback(async () => {
+    const session = sessionRef.current;
+    if (!session || !session.active) return;
+
+    session.active = false;
+    if (session.stopTimer) window.clearTimeout(session.stopTimer);
+    if (session.recorder?.state === "recording") session.recorder.stop();
+
+    const recordedSeconds = Math.max(0.5, (performance.now() - session.startedAt) / 1000);
+    setPhase("processing");
+    setElapsed(0);
+    setHandsVisible(false);
+    clearCanvas(overlayRef.current);
+
+    // A frame already being tracked finishes in well under a second.
+    await withTimeout(session.trackingLoop, 3000, undefined);
+    const videoBlob = await withTimeout(session.recorderStopped, 3000, null);
+    if (session.abort.signal.aborted || !mountedRef.current) return;
+
+    const trackedFps = session.trackedFrames / recordedSeconds;
+    console.info("[SignEase] Recording captured", {
+      seconds: Math.round(recordedSeconds * 10) / 10,
+      trackedFrames: session.trackedFrames,
+      handFrames: session.handFrames.length,
+      trackedFps: Math.round(trackedFps * 10) / 10,
+      videoBytes: videoBlob?.size ?? 0,
+    });
+    const trackingUsable =
+      !!session.trackingLoop &&
+      !session.trackerFailed &&
+      !session.trackerTooSlow &&
+      trackedFps >= MIN_TRACKED_FPS;
+    const timeoutId = window.setTimeout(() => session.abort.abort(), PREDICTION_TIMEOUT_MS);
+
+    try {
+      let response: PredictionResponse;
+      let mode: PredictionMode;
+
+      const enoughHandFrames = session.handFrames.length >= MIN_HAND_FRAMES;
+
+      if (trackingUsable && !enoughHandFrames) {
+        // Tracking ran at a good rate and barely saw a hand; uploading the
+        // clip would only produce the same answer, slower.
+        showError("No hands detected. Keep at least one hand clearly visible in the frame and try again.");
+        return;
+      } else if (enoughHandFrames && (trackingUsable || !videoBlob)) {
+        mode = "on-device";
+        response = await requestPrediction("/predict-landmarks", packFrames(session.handFrames), {
+          signal: session.abort.signal,
+          headers: { "Content-Type": "application/octet-stream" },
+        });
+      } else if (videoBlob) {
+        // Hand tracking was unavailable or too slow on this device.
+        mode = "server";
+        const formData = new FormData();
+        formData.append("video", videoBlob, `sign_${Date.now()}.${getRecordingExtension(videoBlob.type)}`);
+        response = await requestPrediction("/predict", formData, { signal: session.abort.signal });
+      } else {
+        showError(
+          session.trackingLoop
+            ? "Not enough of the sign was captured. Keep your hands in the frame and try a slightly longer recording."
+            : "This browser could not record the camera. Please try a recent version of Chrome, Edge, Firefox or Safari."
+        );
+        return;
+      }
+
+      if (response.timing) {
+        console.info("[SignEase] Prediction timing", mode, response.timing);
+      }
+      if (!mountedRef.current) return;
+
+      const alternatives = (response.predictions || []).filter(
+        (prediction) => prediction.sign !== response.sign
+      );
+      setResult({ sign: response.sign, confidence: response.confidence, alternatives, mode });
+      setErrorMessage("");
+      setPhase("result");
+      speak(
+        response.confidence >= LOW_CONFIDENCE
+          ? `Predicted sign is ${formatSign(response.sign)}`
+          : `Possibly ${formatSign(response.sign)}`
+      );
+    } catch (error: unknown) {
+      if (error instanceof DOMException && error.name === "AbortError") {
+        if (mountedRef.current) showError("Prediction timed out. Please try again.");
+        return;
+      }
+      console.error("[SignEase] Prediction failed", error);
+      showError(
+        error instanceof PredictionError
+          ? error.message
+          : "Something went wrong while processing the recording. Please try again."
+      );
+    } finally {
+      window.clearTimeout(timeoutId);
+      if (sessionRef.current === session) sessionRef.current = null;
+    }
+  }, [showError, speak]);
+
+  const startRecording = useCallback(
+    (event: React.MouseEvent) => {
+      event.preventDefault();
+      if (isBusy || trackerStatus === "loading" || trackerStatus === "calibrating") return;
+
+      const video = webcamRef.current?.video;
+      const stream = video?.srcObject;
+      if (!video || !(stream instanceof MediaStream) || video.readyState < 2) {
+        showError("The camera is not ready yet. Allow camera access and try again.");
+        return;
+      }
+
+      speechSynthesisRef.current?.cancel();
+      setIsSpeaking(false);
+
+      const { recorder, stopped } = startRecorder(stream);
+      const session: RecordingSession = {
+        active: true,
+        startedAt: performance.now(),
+        handFrames: [],
+        trackedFrames: 0,
+        trackerFailed: false,
+        trackerTooSlow: false,
+        trackingLoop: null,
+        recorder,
+        recorderStopped: stopped,
+        stopTimer: null,
+        abort: new AbortController(),
+      };
+      sessionRef.current = session;
+
+      if (trackerStatus === "ready" && trackerRef.current) {
+        session.trackingLoop = runTrackingLoop(session, video);
+      } else if (!recorder) {
+        sessionRef.current = null;
+        showError("This browser cannot record video. Please try a recent version of Chrome, Edge, Firefox or Safari.");
+        return;
+      }
+
+      session.stopTimer = window.setTimeout(() => void finishRecording(), duration * 1000);
+      setResult(null);
+      setErrorMessage("");
+      setElapsed(0);
+      setPhase("recording");
+    },
+    [duration, finishRecording, isBusy, runTrackingLoop, showError, trackerRef, trackerStatus]
+  );
+
+  const resetResult = () => {
+    setResult(null);
+    setErrorMessage("");
+    setPhase("idle");
+  };
+
+  const handleCameraError = useCallback((error: string | DOMException) => {
+    const name = typeof error === "string" ? error : error.name;
+    setCameraReady(false);
+    setCameraError(
+      name === "NotAllowedError" || name === "SecurityError"
+        ? "Camera access was blocked. Allow camera access in your browser's site settings, then retry."
+        : name === "NotFoundError" || name === "OverconstrainedError"
+          ? "No camera was found. Connect a camera and retry."
+          : name === "NotReadableError"
+            ? "The camera is in use by another application. Close it and retry."
+            : "The camera could not be started. Please retry."
+    );
+  }, []);
+
+  const retryCamera = () => {
+    setCameraError("");
+    setCameraKey((key) => key + 1);
+  };
 
   // Animation variants consistent with home page
   const fadeUpVariants = {
@@ -738,19 +742,17 @@ const SignDetection: React.FC<SignDetectionProps> = React.memo(() => {
   // Added pulse animation for action buttons
   const pulseAnimation = {
     scale: [1, 1.02, 1],
-    transition: { 
-      duration: 2, 
-      repeat: Infinity, 
-      ease: "easeInOut" 
+    transition: {
+      duration: 2,
+      repeat: Infinity,
+      ease: "easeInOut"
     }
   };
 
-  if (!isClient) {
-    return null; // Prevent hydration issues
-  }
-
-  // Don't render until mounted
-  if (!mounted) return null;
+  const shownSeconds = Math.min(duration, Math.floor(elapsed));
+  const confidencePercent = result ? Math.round(result.confidence * 1000) / 10 : 0;
+  const trackerPreparing = trackerStatus === "loading" || trackerStatus === "calibrating";
+  const startDisabled = isBusy || trackerPreparing || !cameraReady;
 
   return (
     <div
@@ -759,12 +761,19 @@ const SignDetection: React.FC<SignDetectionProps> = React.memo(() => {
         inter.variable,
         pacifico.variable
       )}
-      suppressHydrationWarning
     >
+      <Head>
+        <title>Sign Detection | SignEase</title>
+        <meta
+          name="description"
+          content="Record a sign with your webcam and get an instant AI prediction."
+        />
+      </Head>
+
       {/* Background with consistent styling */}
       <div className="fixed inset-0">
         <div className="absolute inset-0 bg-[#030303]" />
-        <motion.div 
+        <motion.div
           className="absolute inset-0 bg-gradient-to-br from-indigo-500/[0.05] via-transparent to-rose-500/[0.05]"
           animate={{
             opacity: [0.7, 1, 0.7],
@@ -776,13 +785,13 @@ const SignDetection: React.FC<SignDetectionProps> = React.memo(() => {
           }}
         />
         <div className="absolute inset-0">
-          <motion.div className="absolute inset-0 bg-[radial-gradient(circle_at_50%_120%,rgba(120,119,198,0.3),rgba(255,255,255,0)_60%)]" />
-          <motion.div className="absolute inset-0 bg-gradient-to-t from-black/20 via-transparent to-black/20" />
+          <div className="absolute inset-0 bg-[radial-gradient(circle_at_50%_120%,rgba(120,119,198,0.3),rgba(255,255,255,0)_60%)]" />
+          <div className="absolute inset-0 bg-gradient-to-t from-black/20 via-transparent to-black/20" />
         </div>
       </div>
 
       {/* Add geometric shapes for visual consistency */}
-      <div className="absolute inset-0 w-full h-full overflow-hidden">
+      <div className="absolute inset-0 w-full h-full overflow-hidden pointer-events-none">
         <ElegantShape
           delay={0.3}
           width={600}
@@ -819,13 +828,13 @@ const SignDetection: React.FC<SignDetectionProps> = React.memo(() => {
           <div className="absolute inset-0 bg-gradient-to-b from-black/90 via-black/50 to-transparent pointer-events-none" />
           <div className="absolute inset-0 backdrop-blur-[8px] backdrop-saturate-150 bg-black/5 pointer-events-none" />
 
-          <div className="relative z-10 flex items-center justify-between w-full px-6 min-h-[80px] py-4">
+          <div className="relative z-10 flex items-center justify-between w-full px-4 sm:px-6 min-h-[72px] sm:min-h-[80px] py-3 sm:py-4 gap-4">
             <motion.div
               custom={0}
               variants={fadeUpVariants}
               initial="hidden"
               animate="visible"
-              className="flex items-center gap-4"
+              className="flex items-center gap-4 shrink-0"
             >
               <Link
                 href="/"
@@ -840,7 +849,7 @@ const SignDetection: React.FC<SignDetectionProps> = React.memo(() => {
                 />
                 <span
                   className={cn(
-                    "text-2xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-indigo-300 via-white/90 to-rose-300 ml-3 leading-relaxed tracking-wide overflow-visible py-2",
+                    "text-xl sm:text-2xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-indigo-300 via-white/90 to-rose-300 ml-3 leading-relaxed tracking-wide overflow-visible py-2",
                     pacifico.className
                   )}
                 >
@@ -854,50 +863,33 @@ const SignDetection: React.FC<SignDetectionProps> = React.memo(() => {
               variants={fadeUpVariants}
               initial="hidden"
               animate="visible"
-              className="flex gap-4 text-white/90"
+              className="flex gap-3 sm:gap-4 text-sm sm:text-base text-white/90"
             >
-              <motion.div whileHover={{ scale: 1.05, color: "#818cf8" }} transition={{ type: "spring", stiffness: 400, damping: 10 }}>
-                <Link
-                  href="/"
-                  className="hover:text-indigo-400 transition-all"
+              {[
+                { href: "/", label: "Home", mobile: true },
+                { href: "/dictionary", label: "Dictionary", mobile: true },
+                { href: "/#technology", label: "Technology", mobile: false },
+                { href: "/#team", label: "Team", mobile: false },
+                { href: "/#contact", label: "Contact", mobile: false },
+              ].map((link) => (
+                <motion.div
+                  key={link.href}
+                  whileHover={{ scale: 1.05, color: "#818cf8" }}
+                  transition={{ type: "spring", stiffness: 400, damping: 10 }}
+                  className={link.mobile ? undefined : "hidden md:block"}
                 >
-                  Home
-                </Link>
-              </motion.div>
-              
-              <motion.div whileHover={{ scale: 1.05, color: "#818cf8" }} transition={{ type: "spring", stiffness: 400, damping: 10 }}>
-                <Link
-                  href="/#technology"
-                  className="hover:text-indigo-400 transition-all"
-                >
-                  Technology
-                </Link>
-              </motion.div>
-              
-              <motion.div whileHover={{ scale: 1.05, color: "#818cf8" }} transition={{ type: "spring", stiffness: 400, damping: 10 }}>
-                <Link
-                  href="/#team"
-                  className="hover:text-indigo-400 transition-all"
-                >
-                  Team
-                </Link>
-              </motion.div>
-              
-              <motion.div whileHover={{ scale: 1.05, color: "#818cf8" }} transition={{ type: "spring", stiffness: 400, damping: 10 }}>
-                <Link
-                  href="/#contact"
-                  className="hover:text-indigo-400 transition-all"
-                >
-                  Contact
-                </Link>
-              </motion.div>
+                  <Link href={link.href} className="hover:text-indigo-400 transition-all">
+                    {link.label}
+                  </Link>
+                </motion.div>
+              ))}
             </motion.div>
           </div>
         </nav>
 
         {/* Main content */}
         <main className="relative py-8 px-4">
-          <div className="container mx-auto">
+          <div className="container mx-auto px-0 sm:px-4">
             <div className="flex flex-col min-h-screen items-center justify-center pt-16">
               {/* Module introduction */}
               <motion.div
@@ -935,8 +927,8 @@ const SignDetection: React.FC<SignDetectionProps> = React.memo(() => {
                   </span>
                 </motion.div>
 
-                <motion.h1 
-                  className="text-5xl sm:text-6xl md:text-7xl font-bold mb-4"
+                <motion.h1
+                  className="text-4xl sm:text-6xl md:text-7xl font-bold mb-4"
                   initial={{ opacity: 0, y: -20 }}
                   animate={{ opacity: 1, y: 0 }}
                   transition={{ duration: 0.8, delay: 0.3 }}
@@ -963,7 +955,7 @@ const SignDetection: React.FC<SignDetectionProps> = React.memo(() => {
                   </motion.span>
                 </motion.h1>
 
-                <motion.p 
+                <motion.p
                   className="text-base sm:text-lg text-white/60 max-w-2xl mx-auto"
                   initial={{ opacity: 0 }}
                   animate={{ opacity: 1 }}
@@ -982,6 +974,7 @@ const SignDetection: React.FC<SignDetectionProps> = React.memo(() => {
                     className="mt-4 mb-2"
                   >
                     <button
+                      type="button"
                       onClick={handleManualSpeech}
                       className="inline-flex items-center gap-2 px-4 py-2 bg-indigo-500/20 rounded-full border border-indigo-500/30 hover:bg-indigo-500/30 transition-colors"
                     >
@@ -991,7 +984,7 @@ const SignDetection: React.FC<SignDetectionProps> = React.memo(() => {
                   </motion.div>
                 )}
 
-                {/* Add speaking indicator when welcome message is playing */}
+                {/* Speaking indicator while speech is playing */}
                 {isSpeaking && (
                   <motion.div
                     initial={{ opacity: 0, scale: 0.9 }}
@@ -999,89 +992,131 @@ const SignDetection: React.FC<SignDetectionProps> = React.memo(() => {
                     transition={{ duration: 0.3 }}
                     className="inline-flex items-center gap-2 mt-4 px-4 py-2 bg-indigo-500/20 rounded-full border border-indigo-500/30"
                   >
-                    <motion.div 
-                      animate={{ 
+                    <motion.div
+                      animate={{
                         scale: [1, 1.2, 1],
                         opacity: [0.5, 1, 0.5]
                       }}
                       transition={{ duration: 1.5, repeat: Infinity }}
                       className="w-2 h-2 bg-indigo-400 rounded-full"
                     />
-                    <span className="text-sm text-white/80">Speaking instructions...</span>
-                    <button 
-                      onClick={() => {
-                        if (speechSynthesisRef.current) {
-                          speechSynthesisRef.current.cancel();
-                          setIsSpeaking(false);
-                          setHasPlayedWelcome(true);
-                          sessionStorage.setItem(WELCOME_SPEECH_SESSION_KEY, 'true');
-                        }
-                      }}
+                    <span className="text-sm text-white/80">Speaking…</span>
+                    <button
+                      type="button"
+                      onClick={skipSpeech}
                       className="ml-2 text-xs text-white/60 hover:text-white/90"
                     >
                       Skip
                     </button>
                   </motion.div>
                 )}
-                
-                {/* Remove the visible debug message that was showing errors to users */}
               </motion.div>
 
               {/* Main interaction area */}
-                <motion.div
+              <motion.div
                 initial={{ opacity: 0, y: 20 }}
                 animate={{ opacity: 1, y: 0 }}
                 transition={{ duration: 0.7, delay: 0.3 }}
                 className="w-full max-w-5xl mx-auto"
               >
-                <motion.div 
-                  className="bg-white/[0.03] backdrop-blur-md border border-white/10 rounded-2xl p-6 md:p-8 shadow-2xl"
+                <motion.div
+                  className="bg-white/[0.03] backdrop-blur-md border border-white/10 rounded-2xl p-4 sm:p-6 md:p-8 shadow-2xl"
                   whileHover={{ boxShadow: "0 0 25px rgba(255,255,255,0.08)" }}
                   transition={{ duration: 0.5 }}
                 >
                   <div className="flex flex-col lg:flex-row gap-8">
                     {/* Webcam section with enhanced styling */}
-                    <div className="flex-1 relative">
-                      <motion.div 
+                    <div className="flex-1 min-w-0 relative">
+                      <motion.div
                         className="rounded-xl overflow-hidden relative aspect-video bg-gradient-to-br from-black/30 to-black/10 border border-white/10"
                         whileHover={{ borderColor: "rgba(255,255,255,0.2)" }}
                         transition={{ duration: 0.3 }}
                       >
                         <Webcam
+                          key={cameraKey}
                           audio={false}
                           ref={webcamRef}
-                          screenshotFormat="image/jpeg"
                           videoConstraints={VIDEO_CONSTRAINTS}
+                          onUserMedia={() => {
+                            setCameraError("");
+                            setCameraReady(true);
+                          }}
+                          onUserMediaError={handleCameraError}
+                          playsInline
+                          muted
                           className="w-full h-full object-cover rounded-lg"
                           style={{ transform: "scaleX(-1)" }}
                         />
+                        {/* Live hand landmarks, mirrored like the preview */}
+                        <canvas
+                          ref={overlayRef}
+                          aria-hidden="true"
+                          className={cn(
+                            "absolute inset-0 w-full h-full object-cover pointer-events-none transition-opacity",
+                            isRecording ? "opacity-100" : "opacity-0"
+                          )}
+                          style={{ transform: "scaleX(-1)" }}
+                        />
+
+                        {!cameraReady && (
+                          <div className="absolute inset-0 flex flex-col items-center justify-center gap-4 p-6 text-center bg-black/60">
+                            {cameraError ? (
+                              <>
+                                <FaExclamationTriangle className="text-3xl text-amber-400" />
+                                <p className="text-sm text-white/80 max-w-sm">{cameraError}</p>
+                                <Button
+                                  type="button"
+                                  onClick={retryCamera}
+                                  variant="outline"
+                                  className="bg-white/5 hover:bg-white/10 border-white/10 text-white rounded-full"
+                                >
+                                  <IoRefreshOutline className="mr-2" /> Retry camera
+                                </Button>
+                              </>
+                            ) : (
+                              <>
+                                <div className="w-10 h-10 rounded-full border-4 border-indigo-500/20 border-t-indigo-500 animate-spin" />
+                                <p className="text-sm text-white/70">Waiting for camera access…</p>
+                              </>
+                            )}
+                          </div>
+                        )}
 
                         {/* Enhanced overlay elements */}
-                        {capturing && (
-                          <motion.div 
-                            className="absolute inset-0 flex items-center justify-center"
+                        {isRecording && (
+                          <motion.div
+                            className="absolute inset-0 pointer-events-none"
                             initial={{ opacity: 0 }}
                             animate={{ opacity: 1 }}
                             transition={{ duration: 0.3 }}
                           >
-                            <motion.div 
+                            <motion.div
                               className="absolute top-4 right-4 bg-black/60 text-white px-3 py-1.5 rounded-full backdrop-blur-md border border-white/10 flex items-center gap-2"
                               animate={{ backgroundColor: ["rgba(0,0,0,0.6)", "rgba(0,0,0,0.7)", "rgba(0,0,0,0.6)"] }}
                               transition={{ duration: 2, repeat: Infinity, ease: "easeInOut" }}
                             >
                               <div className="animate-pulse w-3 h-3 bg-red-500 rounded-full"></div>
-                              <span className="font-medium">
-                                {timer}s / {duration}s
+                              <span className="font-medium tabular-nums">
+                                {shownSeconds}s / {duration}s
                               </span>
                             </motion.div>
+                            {trackerStatus === "ready" && (
+                              <div
+                                className={cn(
+                                  "absolute top-4 left-4 px-3 py-1.5 rounded-full backdrop-blur-md border text-xs font-medium flex items-center gap-2",
+                                  handsVisible
+                                    ? "bg-emerald-500/20 border-emerald-400/30 text-emerald-200"
+                                    : "bg-amber-500/20 border-amber-400/30 text-amber-200"
+                                )}
+                              >
+                                <FaHandPaper />
+                                {handsVisible ? "Hands tracked" : "Show your hands"}
+                              </div>
+                            )}
                             <div className="absolute bottom-4 left-0 right-0 mx-auto w-3/4 h-1.5 bg-black/40 rounded-full overflow-hidden">
-                              <motion.div
-                                className="h-full bg-gradient-to-r from-indigo-500 to-rose-500 rounded-full"
-                                initial={{ width: "0%" }}
-                                animate={{
-                                  width: `${(timer / duration) * 100}%`,
-                                }}
-                                transition={{ duration: 0.5, ease: "linear" }}
+                              <div
+                                className="h-full bg-gradient-to-r from-indigo-500 to-rose-500 rounded-full transition-[width] duration-100 ease-linear"
+                                style={{ width: `${Math.min(100, (elapsed / duration) * 100)}%` }}
                               />
                             </div>
                           </motion.div>
@@ -1094,31 +1129,40 @@ const SignDetection: React.FC<SignDetectionProps> = React.memo(() => {
                         <div className="absolute bottom-0 right-0 w-6 h-6 border-b-2 border-r-2 border-white/20 rounded-br-lg z-10"></div>
                       </motion.div>
 
-                      <div className="mt-6 flex flex-wrap justify-center gap-4">
-                        {!capturing ? (
+                      <div className="mt-3 flex items-center justify-center gap-2 text-xs text-white/50" aria-live="polite">
+                        <span
+                          className={cn(
+                            "h-2 w-2 rounded-full",
+                            trackerStatus === "ready"
+                              ? "bg-emerald-400"
+                              : trackerPreparing
+                                ? "bg-amber-400 animate-pulse"
+                                : "bg-sky-400"
+                          )}
+                        />
+                        {trackerLabel(trackerStatus)}
+                      </div>
+
+                      <div className="mt-5 flex flex-wrap justify-center gap-4">
+                        {!isRecording ? (
                           <motion.div
-                            whileHover={{ scale: 1.05 }}
-                            whileTap={{ scale: 0.95 }}
-                            animate={pulseAnimation}
+                            whileHover={startDisabled ? undefined : { scale: 1.05 }}
+                            whileTap={startDisabled ? undefined : { scale: 0.95 }}
+                            animate={startDisabled ? undefined : pulseAnimation}
                           >
                             <Button
-                              onClick={handleStartRecording}
+                              type="button"
+                              onClick={startRecording}
+                              disabled={startDisabled}
                               className="bg-gradient-to-r from-indigo-500 to-rose-500 hover:opacity-90 text-white transition-all flex items-center gap-3 px-8 py-6 rounded-full shadow-lg shadow-indigo-500/20"
                             >
-                              <motion.div
-                                animate={{ 
-                                  scale: [1, 1.2, 1],
-                                }}
-                                transition={{ 
-                                  duration: 2,
-                                  repeat: Infinity,
-                                  ease: "easeInOut" 
-                                }}
-                              >
-                                <FaCamera className="text-lg" />
-                              </motion.div>
+                              <FaCamera className="text-lg" />
                               <span className="text-base font-medium">
-                                Start Recording
+                                {phase === "processing"
+                                  ? "Analyzing…"
+                                  : trackerPreparing && cameraReady
+                                    ? "Preparing…"
+                                    : "Start Recording"}
                               </span>
                             </Button>
                           </motion.div>
@@ -1135,7 +1179,8 @@ const SignDetection: React.FC<SignDetectionProps> = React.memo(() => {
                             }}
                           >
                             <Button
-                              onClick={stopRecording}
+                              type="button"
+                              onClick={() => void finishRecording()}
                               variant="destructive"
                               className="px-8 py-6 rounded-full flex items-center gap-3 shadow-lg shadow-rose-500/20"
                             >
@@ -1152,13 +1197,11 @@ const SignDetection: React.FC<SignDetectionProps> = React.memo(() => {
                           whileTap={{ scale: 0.95 }}
                         >
                           <Button
-                            onClick={() => {
-                              setPrediction("No sign detected");
-                              setConfidence(0);
-                            }}
+                            type="button"
+                            onClick={resetResult}
                             variant="outline"
                             className="bg-white/5 hover:bg-white/10 border-white/10 text-white px-6 py-6 rounded-full"
-                            disabled={capturing}
+                            disabled={isBusy}
                           >
                             <IoRefreshOutline className="text-lg mr-2" /> Reset
                           </Button>
@@ -1167,44 +1210,36 @@ const SignDetection: React.FC<SignDetectionProps> = React.memo(() => {
 
                       <div className="mt-8">
                         <div className="flex items-center justify-between mb-3">
-                          <label className="text-white/70 text-sm font-medium">
+                          <label id="recording-duration-label" className="text-white/70 text-sm font-medium">
                             Recording Duration
                           </label>
-                          <motion.span 
-                            className="text-white/90 font-medium px-3 py-1 bg-white/5 rounded-full"
-                            animate={capturing ? { scale: [1, 1.1, 1] } : {}}
-                            transition={{ duration: 1, repeat: capturing ? Infinity : 0 }}
-                          >
-                            {duration} seconds
-                          </motion.span>
+                          <span className="text-white/90 font-medium px-3 py-1 bg-white/5 rounded-full tabular-nums">
+                            {duration} {duration === 1 ? "second" : "seconds"}
+                          </span>
                         </div>
-                        <div className="flex items-center gap-4">
-                          <div className="flex-1">
-                            <Slider
-                              value={[duration]}
-                              onValueChange={(value) => setDuration(value[0])}
-                              max={MAX_RECORDING_DURATION}
-                              min={1}
-                              step={1}
-                              disabled={capturing}
-                              className="relative z-10"
-                            />
-                          </div>
-                        </div>
+                        <Slider
+                          value={[duration]}
+                          onValueChange={(value) => setDuration(value[0] ?? DEFAULT_RECORDING_DURATION)}
+                          max={MAX_RECORDING_DURATION}
+                          min={MIN_RECORDING_DURATION}
+                          step={1}
+                          disabled={isBusy}
+                          aria-labelledby="recording-duration-label"
+                          className="relative z-10"
+                        />
                       </div>
 
-                      {/* Replace the existing dictionary button with improved PixelCard */}
                       <div className="mt-12 pt-4 border-t border-white/10">
-                        <motion.div 
+                        <motion.div
                           initial={{ opacity: 0, y: 10 }}
                           animate={{ opacity: 1, y: 0 }}
                           transition={{ duration: 0.6, delay: 0.2 }}
                           className="flex justify-center"
                         >
-                          <Link href="/dictionary">
-                            <PixelCard 
-                              variant="pink" 
-                              className="h-[120px] w-[320px] cursor-pointer hover:scale-[1.02] transition-transform"
+                          <Link href="/dictionary" className="max-w-full">
+                            <PixelCard
+                              variant="pink"
+                              className="h-[120px] w-[320px] max-w-full cursor-pointer hover:scale-[1.02] transition-transform"
                             >
                               <div className="absolute inset-0 flex items-center justify-center">
                                 <div className="flex flex-col items-center gap-1 z-10">
@@ -1234,89 +1269,81 @@ const SignDetection: React.FC<SignDetectionProps> = React.memo(() => {
                       </div>
                     </div>
 
-                    {/* Enhanced Result section with better styling and animations */}
-                    <div className="flex-1 flex flex-col lg:border-l lg:border-white/10 lg:pl-8">
-                      <motion.h3 
-                        className="text-2xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-indigo-300 via-white/90 to-rose-300 mb-6"
-                        animate={{
-                          textShadow: [
-                            "0 0 0px rgba(255,255,255,0)",
-                            "0 0 2px rgba(255,255,255,0.3)",
-                            "0 0 0px rgba(255,255,255,0)"
-                          ]
-                        }}
-                        transition={{ duration: 3, repeat: Infinity, ease: "easeInOut" }}
-                      >
+                    {/* Result section */}
+                    <div className="flex-1 min-w-0 flex flex-col lg:border-l lg:border-white/10 lg:pl-8">
+                      <h3 className="text-2xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-indigo-300 via-white/90 to-rose-300 mb-6">
                         Recognition Results
-                      </motion.h3>
+                      </h3>
 
                       <div className="flex-1 flex flex-col">
-                        <motion.div 
-                          className="bg-white/[0.02] border border-white/[0.05] rounded-xl p-6 h-full flex flex-col"
-                          whileHover={{ borderColor: "rgba(255,255,255,0.1)" }}
-                          transition={{ duration: 0.3 }}
+                        <div
+                          className="bg-white/[0.02] border border-white/[0.05] rounded-xl p-6 h-full min-h-[280px] flex flex-col"
+                          aria-live="polite"
                         >
-                          {capturing ? (
+                          {phase === "recording" ? (
                             <div className="flex-1 flex items-center justify-center flex-col">
-                              <motion.div
-                                animate={{ 
-                                  rotate: [0, 360],
-                                  boxShadow: [
-                                    "0 0 0 rgba(129, 140, 248, 0)",
-                                    "0 0 15px rgba(129, 140, 248, 0.3)",
-                                    "0 0 0 rgba(129, 140, 248, 0)"
-                                  ]
-                                }}
-                                transition={{ 
-                                  rotate: { duration: 2, repeat: Infinity, ease: "linear" },
-                                  boxShadow: { duration: 2, repeat: Infinity, ease: "easeInOut" }
-                                }}
-                              >
-                                <div className="w-16 h-16 rounded-full border-4 border-indigo-500/20 border-t-indigo-500"></div>
-                              </motion.div>
-                              <motion.p 
+                              <div className="w-16 h-16 rounded-full border-4 border-indigo-500/20 border-t-indigo-500 animate-spin" />
+                              <motion.p
                                 className="mt-6 text-white/60"
                                 animate={{ opacity: [0.6, 1, 0.6] }}
                                 transition={{ duration: 1.5, repeat: Infinity }}
                               >
-                                Recording in progress...
+                                Recording in progress…
                               </motion.p>
                             </div>
-                          ) : prediction === "Processing video..." ? (
+                          ) : phase === "processing" ? (
                             <div className="flex-1 flex items-center justify-center flex-col">
                               <div className="relative w-20 h-20">
                                 <motion.div
                                   className="absolute inset-0 rounded-full border-4 border-rose-500/20"
-                                  animate={{ 
+                                  animate={{
                                     scale: [1, 1.1, 1],
                                     opacity: [0.5, 0.8, 0.5]
                                   }}
                                   transition={{ duration: 2, repeat: Infinity }}
                                 ></motion.div>
                                 <motion.div
-                                  className="absolute inset-0 rounded-full border-4 border-t-rose-500 border-r-rose-500/50"
+                                  className="absolute inset-0 rounded-full border-4 border-transparent border-t-rose-500 border-r-rose-500/50"
                                   animate={{ rotate: [0, 360] }}
                                   transition={{ duration: 1.5, repeat: Infinity, ease: "linear" }}
                                 ></motion.div>
                               </div>
-                              <motion.p 
+                              <motion.p
                                 className="mt-6 text-white/60"
                                 animate={{ opacity: [0.6, 1, 0.6] }}
                                 transition={{ duration: 1.5, repeat: Infinity }}
                               >
-                                AI model processing...
+                                AI model processing…
                               </motion.p>
                             </div>
-                          ) : prediction !== "No sign detected" ? (
-                            <motion.div 
+                          ) : phase === "error" ? (
+                            <motion.div
+                              className="flex-1 flex flex-col items-center justify-center text-center"
+                              initial={{ opacity: 0 }}
+                              animate={{ opacity: 1 }}
+                              transition={{ duration: 0.4 }}
+                            >
+                              <div className="w-20 h-20 rounded-full bg-amber-500/10 border border-amber-500/20 flex items-center justify-center mb-5">
+                                <FaExclamationTriangle className="text-3xl text-amber-400" />
+                              </div>
+                              <h4 className="text-xl font-medium text-white/90 mb-2">
+                                Couldn&apos;t recognize the sign
+                              </h4>
+                              <p className="text-white/60 max-w-md text-sm">{errorMessage}</p>
+                            </motion.div>
+                          ) : phase === "result" && result ? (
+                            <motion.div
                               className="flex-1 flex flex-col items-center justify-center text-center"
                               initial={{ opacity: 0 }}
                               animate={{ opacity: 1 }}
                               transition={{ duration: 0.5 }}
                             >
-                              <motion.div
-                                className="w-20 h-20 rounded-full bg-gradient-to-br from-indigo-500/20 to-rose-500/20 flex items-center justify-center mb-6"
-                                animate={{ 
+                              <motion.button
+                                type="button"
+                                onClick={() => speak(`Predicted sign is ${formatSign(result.sign)}`)}
+                                aria-label={`Speak ${formatSign(result.sign)}`}
+                                className="w-20 h-20 rounded-full bg-gradient-to-br from-indigo-500/20 to-rose-500/20 flex items-center justify-center mb-6 hover:from-indigo-500/30 hover:to-rose-500/30 transition-colors"
+                                animate={{
                                   boxShadow: [
                                     "0 0 0 rgba(255,255,255,0)",
                                     "0 0 25px rgba(129, 140, 248, 0.3)",
@@ -1325,44 +1352,24 @@ const SignDetection: React.FC<SignDetectionProps> = React.memo(() => {
                                 }}
                                 transition={{ duration: 3, repeat: Infinity, ease: "easeInOut" }}
                               >
-                                <motion.div
-                                  initial={{ scale: 0 }}
-                                  animate={{ 
-                                    scale: 1,
-                                    rotate: [0, 5, -5, 0]
-                                  }}
-                                  transition={{
-                                    scale: { type: "spring", stiffness: 260, damping: 20 },
-                                    rotate: { duration: 2, repeat: Infinity, ease: "easeInOut" }
-                                  }}
-                                >
-                                  <IoVolumeHigh className="text-4xl text-white/90" />
-                                </motion.div>
-                              </motion.div>
-                              
+                                <IoVolumeHigh className="text-4xl text-white/90" />
+                              </motion.button>
+
                               <motion.div
                                 initial={{ opacity: 0, y: 20 }}
                                 animate={{ opacity: 1, y: 0 }}
                                 transition={{ duration: 0.6, delay: 0.2 }}
-                                className="space-y-6"
+                                className="space-y-6 w-full"
                               >
-                                <motion.h3
+                                <h3
                                   className={cn(
-                                    "text-4xl font-bold text-white",
+                                    "text-4xl font-bold text-white capitalize break-words",
                                     pacifico.className
                                   )}
-                                  animate={{
-                                    textShadow: [
-                                      "0 0 0px rgba(255,255,255,0)",
-                                      "0 0 3px rgba(255,255,255,0.3)",
-                                      "0 0 0px rgba(255,255,255,0)"
-                                    ]
-                                  }}
-                                  transition={{ duration: 3, repeat: Infinity, ease: "easeInOut" }}
                                 >
-                                  {prediction}
-                                </motion.h3>
-                                
+                                  {formatSign(result.sign)}
+                                </h3>
+
                                 <div className="flex flex-col items-center">
                                   <p className="text-white/60 text-sm mb-2">
                                     Confidence Level
@@ -1371,26 +1378,52 @@ const SignDetection: React.FC<SignDetectionProps> = React.memo(() => {
                                     <motion.div
                                       className="h-full bg-gradient-to-r from-indigo-500 to-rose-500"
                                       initial={{ width: 0 }}
-                                      animate={{ width: `${confidence}%` }}
+                                      animate={{ width: `${confidencePercent}%` }}
                                       transition={{
                                         duration: 0.8,
                                         ease: "easeOut",
                                       }}
                                     ></motion.div>
                                   </div>
-                                  <motion.p 
-                                    className="text-white/90 font-medium px-4 py-1 bg-white/5 rounded-full"
-                                    initial={{ scale: 0.8 }}
-                                    animate={{ scale: 1 }}
-                                    transition={{ type: "spring", stiffness: 300, damping: 10 }}
-                                  >
-                                    {confidence.toFixed(2)}%
-                                  </motion.p>
+                                  <p className="text-white/90 font-medium px-4 py-1 bg-white/5 rounded-full tabular-nums">
+                                    {confidencePercent.toFixed(1)}%
+                                  </p>
+                                  {result.confidence < LOW_CONFIDENCE && (
+                                    <p className="mt-3 text-xs text-amber-300/90 max-w-xs">
+                                      Low confidence. Try again with your hands fully in frame and the sign performed clearly.
+                                    </p>
+                                  )}
                                 </div>
+
+                                {result.alternatives.length > 0 && (
+                                  <div className="text-sm">
+                                    <p className="text-white/50 mb-2">Other possibilities</p>
+                                    <div className="flex flex-wrap justify-center gap-2">
+                                      {result.alternatives.map((alternative) => (
+                                        <span
+                                          key={alternative.sign}
+                                          className="px-3 py-1 rounded-full bg-white/5 border border-white/10 text-white/80 capitalize"
+                                        >
+                                          {formatSign(alternative.sign)}{" "}
+                                          <span className="text-white/40 tabular-nums">
+                                            {(alternative.confidence * 100).toFixed(1)}%
+                                          </span>
+                                        </span>
+                                      ))}
+                                    </div>
+                                  </div>
+                                )}
+
+                                <Link
+                                  href={`/dictionary?query=${encodeURIComponent(result.sign)}`}
+                                  className="inline-flex items-center gap-2 text-sm text-indigo-300 hover:text-indigo-200"
+                                >
+                                  See how to sign it <FaArrowRight className="text-xs" />
+                                </Link>
                               </motion.div>
                             </motion.div>
                           ) : (
-                            <motion.div 
+                            <motion.div
                               className="flex-1 flex items-center justify-center flex-col text-center"
                               initial={{ opacity: 0 }}
                               animate={{ opacity: 1 }}
@@ -1398,7 +1431,7 @@ const SignDetection: React.FC<SignDetectionProps> = React.memo(() => {
                             >
                               <motion.div
                                 className="w-20 h-20 rounded-full bg-white/5 flex items-center justify-center mb-4"
-                                animate={{ 
+                                animate={{
                                   y: [0, -10, 0],
                                   opacity: [0.7, 1, 0.7]
                                 }}
@@ -1406,28 +1439,18 @@ const SignDetection: React.FC<SignDetectionProps> = React.memo(() => {
                               >
                                 <FaHandPaper className="text-3xl text-white/40" />
                               </motion.div>
-                              <motion.h4 
-                                className="text-xl font-medium text-white/80 mb-3"
-                                initial={{ y: 20, opacity: 0 }}
-                                animate={{ y: 0, opacity: 1 }}
-                                transition={{ delay: 0.2, duration: 0.5 }}
-                              >
+                              <h4 className="text-xl font-medium text-white/80 mb-3">
                                 No Sign Detected
-                              </motion.h4>
-                              <motion.p 
-                                className="mt-2 text-white/50 max-w-md"
-                                initial={{ y: 20, opacity: 0 }}
-                                animate={{ y: 0, opacity: 1 }}
-                                transition={{ delay: 0.3, duration: 0.5 }}
-                              >
+                              </h4>
+                              <p className="mt-2 text-white/50 max-w-md">
                                 Make a sign gesture in front of the camera and
-                                click "Start Recording" to begin.
-                              </motion.p>
+                                click &quot;Start Recording&quot; to begin.
+                              </p>
                             </motion.div>
                           )}
-                        </motion.div>
+                        </div>
 
-                        <motion.div 
+                        <motion.div
                           className="mt-6 bg-white/[0.02] border border-white/[0.05] rounded-xl p-5"
                           initial={{ opacity: 0, y: 20 }}
                           animate={{ opacity: 1, y: 0 }}
@@ -1440,47 +1463,24 @@ const SignDetection: React.FC<SignDetectionProps> = React.memo(() => {
                             </span>
                             How to use
                           </h4>
-                          
+
                           <ol className="list-decimal list-inside space-y-3 text-sm text-white/60 ml-1">
-                            <motion.li
-                              initial={{ opacity: 0, x: -10 }}
-                              animate={{ opacity: 1 }}
-                              transition={{ duration: 0.5, delay: 0.1 }}
-                            >
-                              Position yourself clearly in the camera view
-                            </motion.li>
-                            <motion.li
-                              initial={{ opacity: 0, x: -10 }}
-                              animate={{ opacity: 1 }}
-                              transition={{ duration: 0.5, delay: 0.2 }}
-                            >
-                              Use the slider below the camera to adjust
-                              recording duration (1-10 seconds)
-                            </motion.li>
-                            <motion.li
-                              initial={{ opacity: 0, x: -10 }}
-                              animate={{ opacity: 1 }}
-                              transition={{ duration: 0.5, delay: 0.3 }}
-                            >
-                              Click the "Start Recording" button and perform
-                              your sign gesture
-                            </motion.li>
-                            <motion.li
-                              initial={{ opacity: 0, x: -10 }}
-                              animate={{ opacity: 1 }}
-                              transition={{ duration: 0.5, delay: 0.4 }}
-                            >
-                              Hold the gesture steadily until recording
-                              completes
-                            </motion.li>
-                            <motion.li
-                              initial={{ opacity: 0, x: -10 }}
-                              animate={{ opacity: 1 }}
-                              transition={{ duration: 0.5, delay: 0.5 }}
-                            >
-                              Wait for AI analysis and your sign language
-                              translation will appear
-                            </motion.li>
+                            {[
+                              "Position yourself so your face and both hands are in the camera view",
+                              `Use the slider to adjust the recording duration (${MIN_RECORDING_DURATION}-${MAX_RECORDING_DURATION} seconds)`,
+                              'Click the "Start Recording" button and perform your sign gesture',
+                              "Perform the whole sign before the recording completes",
+                              "Your sign language translation appears right after recording",
+                            ].map((step, index) => (
+                              <motion.li
+                                key={step}
+                                initial={{ opacity: 0, x: -10 }}
+                                animate={{ opacity: 1, x: 0 }}
+                                transition={{ duration: 0.5, delay: 0.1 * (index + 1) }}
+                              >
+                                {step}
+                              </motion.li>
+                            ))}
                           </ol>
 
                           <div className="mt-3 p-2 bg-indigo-500/10 rounded-lg">
@@ -1491,18 +1491,18 @@ const SignDetection: React.FC<SignDetectionProps> = React.memo(() => {
                             </p>
                           </div>
                         </motion.div>
-                        {/* Add a button to replay welcome message - improved visibility */}
-                        {hasPlayedWelcome && (
-                          <motion.div 
+                        {hasPlayedWelcome && !speechBlocked && (
+                          <motion.div
                             initial={{ opacity: 0, y: 10 }}
                             animate={{ opacity: 1, y: 0 }}
                             transition={{ delay: 1, duration: 0.5 }}
                             className="mt-4 text-center"
                           >
                             <button
+                              type="button"
                               onClick={handleManualSpeech}
                               disabled={isSpeaking}
-                              className="inline-flex items-center gap-1 px-3 py-1 rounded-full bg-white/5 hover:bg-white/10 text-indigo-300 hover:text-indigo-200 transition-colors text-xs"
+                              className="inline-flex items-center gap-1 px-3 py-1 rounded-full bg-white/5 hover:bg-white/10 text-indigo-300 hover:text-indigo-200 transition-colors text-xs disabled:opacity-50"
                             >
                               <IoVolumeHigh className="text-sm" />
                               <span>Replay instructions</span>
@@ -1526,9 +1526,9 @@ const SignDetection: React.FC<SignDetectionProps> = React.memo(() => {
                   Technology Behind SignEase
                 </h3>
                 <p className="text-white/60 mb-6">
-                  Our AI-powered sign language recognition system uses advanced
-                  computer vision and machine learning to provide accurate,
-                  real-time translations.
+                  Hand, face and pose landmarks are tracked on your device with
+                  MediaPipe, and a neural network trained on 250 ASL signs
+                  turns the motion into a prediction.
                 </p>
                 <div className="flex flex-col sm:flex-row justify-center gap-4">
                   <Link
@@ -1545,6 +1545,6 @@ const SignDetection: React.FC<SignDetectionProps> = React.memo(() => {
       </div>
     </div>
   );
-});
+};
 
 export default SignDetection;

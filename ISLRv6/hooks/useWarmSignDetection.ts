@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef } from "react";
 import { useRouter } from "next/navigation";
+import { warmBackend } from "@/lib/api";
 
 const SIGN_DETECTION_ROUTE = "/sign-detection";
 
@@ -14,6 +15,9 @@ export function useWarmSignDetection() {
     didWarm.current = true;
 
     router.prefetch(SIGN_DETECTION_ROUTE);
+    // Free Render instances sleep when idle; start waking the prediction
+    // server while the visitor is still on the landing page.
+    void warmBackend();
 
     fetch(SIGN_DETECTION_ROUTE, {
       method: "GET",

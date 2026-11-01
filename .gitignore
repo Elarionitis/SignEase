@@ -21,6 +21,9 @@ Thumbs.db
 
 # Generated / build output
 .next/
+# Copied from node_modules by ISLRv6/scripts/copy-mediapipe.js
+ISLRv6/public/mediapipe/
+*.tsbuildinfo
 dist/
 build/
 out/
