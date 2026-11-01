@@ -1,15 +1,28 @@
-from flask import Flask, request, jsonify, send_file
-from flask_cors import CORS
-import csv
+"""SignEase prediction API.
+
+Two prediction paths share one TensorFlow Lite model:
+
+* ``POST /predict-landmarks`` (primary): the browser runs MediaPipe Holistic on
+  every camera frame while the user signs and uploads the landmark tensor.
+  The server only runs the classifier, so a prediction takes milliseconds
+  even on a small Render instance, and the model sees the full frame rate it
+  was trained on.
+* ``POST /predict`` (fallback): the browser uploads the recorded clip and the
+  server extracts landmarks itself. This is only used when the browser cannot
+  run MediaPipe, because Holistic on a shared CPU is slow.
+"""
+
+import json
 import logging
 import os
-import time
 import threading
+import time
 from pathlib import Path
 from uuid import uuid4
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+os.environ.setdefault("GLOG_minloglevel", "2")
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
@@ -19,15 +32,30 @@ os.environ.setdefault("XDG_CACHE_HOME", os.path.join(BASE_DIR, ".cache"))
 os.makedirs(os.environ["MPLCONFIGDIR"], exist_ok=True)
 
 import numpy as np
-from gtts import gTTS
+from flask import Flask, jsonify, request
+from flask_cors import CORS
 from werkzeug.exceptions import HTTPException
 
-app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = int(os.environ.get("MAX_UPLOAD_MB", "8")) * 1024 * 1024
-CORS(app, resources={r"/*": {"origins": "*"}})
 
-# Flask defaults to warning-level logs under Gunicorn, which hid the request
-# timing needed to diagnose production prediction failures.
+def env_int(name, default, minimum=1):
+    try:
+        return max(minimum, int(os.environ.get(name, default)))
+    except ValueError:
+        return default
+
+
+app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = env_int("MAX_UPLOAD_MB", 8) * 1024 * 1024
+
+cors_origins = [
+    origin.strip()
+    for origin in os.environ.get("CORS_ORIGINS", "*").split(",")
+    if origin.strip()
+]
+CORS(app, resources={r"/*": {"origins": cors_origins or "*"}}, max_age=86400)
+
+# Flask defaults to warning-level logs under Gunicorn, which hides the request
+# timing needed to diagnose production prediction latency.
 gunicorn_logger = logging.getLogger("gunicorn.error")
 if gunicorn_logger.handlers:
     app.logger.handlers = gunicorn_logger.handlers
@@ -35,37 +63,51 @@ app.logger.setLevel(logging.INFO)
 app.logger.propagate = False
 
 ML_DIR = os.path.join(BASE_DIR, "ML_Code_ISL")
-
 UPLOAD_FOLDER = os.path.join(BASE_DIR, "saved_videos")
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-dummy_parquet_skel_file = os.path.join(ML_DIR, "data", "239181.parquet")
-tflite_model = os.path.join(ML_DIR, "models", "asl_model.tflite")
-csv_file = os.path.join(ML_DIR, "data", "train.csv")
-audio_path = os.path.join(BASE_DIR, "output.mp3")
-ENABLE_TTS = os.environ.get("ENABLE_TTS", "false").lower() == "true"
+TFLITE_MODEL_PATH = os.path.join(ML_DIR, "models", "asl_model.tflite")
+LABEL_MAP_PATH = os.path.join(ML_DIR, "data", "sign_to_prediction_index_map.json")
 
-interpreter = None
-prediction_fn = None
-ORD2SIGN = None
-mp_holistic = None
-holistic = None
-inference_lock = threading.Lock()
-holistic_lock = threading.Lock()
-resource_lock = threading.Lock()
-
-# At the default short recording length, every second frame gives the model a
-# full temporal sequence instead of only a handful of snapshots.
-FRAME_SAMPLE_RATE = int(os.environ.get("FRAME_SAMPLE_RATE", "2"))
-MAX_SAMPLED_FRAMES = int(os.environ.get("MAX_SAMPLED_FRAMES", "12"))
 ROWS_PER_FRAME = 543
+COORDINATES = 3
+FRAME_VALUES = ROWS_PER_FRAME * COORDINATES
+FRAME_BYTES = FRAME_VALUES * 4
 LANDMARK_LAYOUT = (
     ("face", "face_landmarks", 468),
     ("left_hand", "left_hand_landmarks", 21),
     ("pose", "pose_landmarks", 33),
     ("right_hand", "right_hand_landmarks", 21),
 )
-REQUIRED_FILES = (tflite_model, csv_file)
+LEFT_HAND_ROWS = slice(468, 489)
+RIGHT_HAND_ROWS = slice(522, 543)
+
+# Landmark uploads: ~30 fps for the 10 second maximum recording, with headroom.
+MAX_LANDMARK_FRAMES = env_int("MAX_LANDMARK_FRAMES", 600)
+MIN_HAND_FRAMES = env_int("MIN_HAND_FRAMES", 2)
+TOP_K = 3
+# The model contains a RANDOM_UNIFORM op, so repeated runs differ by a couple
+# of percent. Averaging a few ~40 ms passes keeps the reported confidence stable.
+INFERENCE_PASSES = env_int("INFERENCE_PASSES", 3)
+
+# Video fallback. Holistic is the expensive step, so cap how many frames it
+# runs on; the cap still covers a 3 second clip at 15 fps.
+FRAME_SAMPLE_RATE = env_int("FRAME_SAMPLE_RATE", 2)
+MAX_SAMPLED_FRAMES = env_int("MAX_SAMPLED_FRAMES", 48)
+MAX_VIDEO_FRAME_WIDTH = env_int("MAX_VIDEO_FRAME_WIDTH", 640)
+
+interpreter = None
+prediction_fn = None
+ORD2SIGN = None
+holistic = None
+inference_lock = threading.Lock()
+holistic_lock = threading.Lock()
+model_load_lock = threading.Lock()
+holistic_load_lock = threading.Lock()
+
+
+class PredictionInputError(ValueError):
+    """Raised when an upload cannot be turned into model input."""
 
 
 @app.errorhandler(Exception)
@@ -74,24 +116,33 @@ def handle_exception(error):
         return jsonify({"error": error.description}), error.code
 
     app.logger.exception("Unhandled backend error")
-    return jsonify({"error": str(error)}), 500
+    return jsonify({"error": "The prediction server hit an unexpected error. Please try again."}), 500
 
 
-def load_ml_resources():
-    global interpreter, prediction_fn, ORD2SIGN, mp_holistic, holistic
+def load_labels():
+    with open(LABEL_MAP_PATH, encoding="utf-8") as file:
+        sign_to_index = json.load(file)
+
+    labels = {int(index): sign for sign, index in sign_to_index.items()}
+    if sorted(labels) != list(range(len(labels))):
+        raise RuntimeError("Label map indices must be contiguous and start at 0")
+    return labels
+
+
+def load_model():
+    """Loads the classifier. Cheap (~1s), so warmup and /predict-landmarks only need this."""
+    global interpreter, prediction_fn, ORD2SIGN
 
     if prediction_fn is not None:
         return
 
-    with resource_lock:
+    with model_load_lock:
         if prediction_fn is not None:
             return
 
-        missing_files = [path for path in REQUIRED_FILES if not os.path.isfile(path)]
-        if missing_files:
-            raise RuntimeError(f"Missing ML asset(s): {', '.join(missing_files)}")
+        if not os.path.isfile(TFLITE_MODEL_PATH):
+            raise RuntimeError(f"Missing ML model: {TFLITE_MODEL_PATH}")
 
-        import mediapipe as mp
         try:
             from tflite_runtime.interpreter import Interpreter
         except ImportError as error:
@@ -100,239 +151,291 @@ def load_ml_resources():
                 "dependency from requirements.txt"
             ) from error
 
-        if not hasattr(mp, "solutions"):
-            raise RuntimeError(
-                "Installed mediapipe package does not include the legacy solutions "
-                "API required by this backend. Use mediapipe==0.10.14."
+        labels = load_labels()
+        model = Interpreter(
+            model_path=TFLITE_MODEL_PATH,
+            num_threads=env_int("TFLITE_NUM_THREADS", 1),
         )
-
-        mp_holistic = mp.solutions.holistic
-
-        interpreter = Interpreter(model_path=tflite_model, num_threads=1)
-        signature_list = interpreter.get_signature_list()
-        serving_signature = signature_list.get("serving_default")
+        serving_signature = model.get_signature_list().get("serving_default")
         if not serving_signature:
             raise RuntimeError("TFLite model is missing the serving_default signature")
         if "inputs" not in serving_signature.get("inputs", []):
             raise RuntimeError("TFLite serving_default signature is missing the inputs tensor")
         if "outputs" not in serving_signature.get("outputs", []):
             raise RuntimeError("TFLite serving_default signature is missing the outputs tensor")
-        prediction_fn = interpreter.get_signature_runner("serving_default")
+        runner = model.get_signature_runner("serving_default")
 
-        with open(csv_file, newline="", encoding="utf-8") as file:
-            reader = csv.DictReader(file)
-            if "sign" not in (reader.fieldnames or []):
-                raise RuntimeError("Training CSV is missing the sign column")
-            signs = {row["sign"] for row in reader if row.get("sign")}
-        ORD2SIGN = {index: sign for index, sign in enumerate(sorted(signs))}
-        holistic = mp_holistic.Holistic(min_detection_confidence=0.5, min_tracking_confidence=0.5)
+        # The first invocation allocates tensors; do it here instead of
+        # inside the user's first prediction.
+        warm_input = np.full((1, ROWS_PER_FRAME, COORDINATES), np.nan, dtype=np.float32)
+        warm_input[:, RIGHT_HAND_ROWS] = 0.5
+        with inference_lock:
+            runner(inputs=warm_input)
+
+        interpreter = model
+        ORD2SIGN = labels
+        prediction_fn = runner
+
+
+def load_holistic():
+    """Loads MediaPipe Holistic. Only the video fallback needs it."""
+    global holistic
+
+    if holistic is not None:
+        return
+
+    with holistic_load_lock:
+        if holistic is not None:
+            return
+
+        import mediapipe as mp
+
+        if not hasattr(mp, "solutions"):
+            raise RuntimeError(
+                "Installed mediapipe package does not include the legacy solutions "
+                "API required by this backend. Use mediapipe==0.10.14."
+            )
+
+        # Same settings as the browser extractor and the training data.
+        holistic = mp.solutions.holistic.Holistic(
+            static_image_mode=False,
+            model_complexity=1,
+            smooth_landmarks=True,
+            refine_face_landmarks=False,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5,
+        )
+
+
+def hand_frame_mask(frames):
+    left = ~np.all(np.isnan(frames[:, LEFT_HAND_ROWS, 0]), axis=1)
+    right = ~np.all(np.isnan(frames[:, RIGHT_HAND_ROWS, 0]), axis=1)
+    return left | right
+
+
+def select_hand_frames(frames):
+    """Keeps only frames with a visible hand; the model scores signs from hand motion."""
+    hand_frames = frames[hand_frame_mask(frames)]
+    if len(hand_frames) < MIN_HAND_FRAMES:
+        return None
+    return np.ascontiguousarray(hand_frames, dtype=np.float32)
 
 
 def landmarks_to_frame_array(results):
-    frame_landmarks = np.full((ROWS_PER_FRAME, 3), np.nan, dtype=np.float32)
+    frame_landmarks = np.full((ROWS_PER_FRAME, COORDINATES), np.nan, dtype=np.float32)
     offset = 0
 
     for _, result_attr, count in LANDMARK_LAYOUT:
         landmark_data = getattr(results, result_attr)
         if landmark_data:
-            points = landmark_data.landmark
-            frame_landmarks[offset:offset + count, 0] = [point.x for point in points]
-            frame_landmarks[offset:offset + count, 1] = [point.y for point in points]
-            frame_landmarks[offset:offset + count, 2] = [point.z for point in points]
+            frame_landmarks[offset:offset + count] = [
+                (point.x, point.y, point.z) for point in landmark_data.landmark
+            ]
         offset += count
 
     return frame_landmarks
 
 
-def hands_detected(results):
-    """A sign sample is only useful to the model when at least one hand is visible."""
-    return bool(results.left_hand_landmarks or results.right_hand_landmarks)
-
-
 def process_video(video_path):
-    """Processes browser-recorded video and returns model-ready landmark tensors.
+    """Extracts landmark frames from a browser-recorded clip.
 
     Do not seek based on ``CAP_PROP_FRAME_COUNT`` here. WebM files emitted by
-    MediaRecorder frequently report incomplete frame metadata (particularly
-    while the device is also screen recording), so seeking can repeatedly read
-    only an early frame and miss the user's hands entirely.
+    MediaRecorder frequently report incomplete frame metadata, so seeking can
+    repeatedly read only an early frame and miss the user's hands entirely.
     """
     import cv2
 
-    load_ml_resources()
+    load_holistic()
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
-        return None  # Ensure the file is readable
+        raise PredictionInputError("The recording could not be decoded. Please record again.")
 
-    all_landmarks = []
-    frame = 0
+    frames = []
+    frame_index = 0
     try:
         with holistic_lock:
-            while cap.isOpened() and len(all_landmarks) < MAX_SAMPLED_FRAMES:
+            while len(frames) < MAX_SAMPLED_FRAMES:
                 success, image = cap.read()
                 if not success:
                     break
 
-                if frame % FRAME_SAMPLE_RATE == 0:
-                    image.flags.writeable = False
+                if frame_index % FRAME_SAMPLE_RATE == 0:
+                    height, width = image.shape[:2]
+                    if width > MAX_VIDEO_FRAME_WIDTH:
+                        scale = MAX_VIDEO_FRAME_WIDTH / width
+                        image = cv2.resize(
+                            image,
+                            (MAX_VIDEO_FRAME_WIDTH, int(height * scale)),
+                            interpolation=cv2.INTER_AREA,
+                        )
                     image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-                    results = holistic.process(image)
-                    if hands_detected(results):
-                        all_landmarks.append(landmarks_to_frame_array(results))
+                    image.flags.writeable = False
+                    frames.append(landmarks_to_frame_array(holistic.process(image)))
 
-                frame += 1
+                frame_index += 1
     finally:
         cap.release()
 
-    if not all_landmarks:
-        return None  # No usable hand landmarks were detected
+    if not frames:
+        raise PredictionInputError("The recording did not contain any video frames. Please record again.")
 
-    app.logger.info("Extracted %s hand-visible frames for prediction", len(all_landmarks))
-    return np.stack(all_landmarks, axis=0)
-
-
-def normalize_model_outputs(outputs):
-    outputs = np.asarray(outputs, dtype=np.float32).reshape(-1)
-    if outputs.size == 0 or not np.isfinite(outputs).any():
-        return np.array([])
-
-    outputs = np.nan_to_num(outputs, nan=-np.inf, posinf=-np.inf, neginf=-np.inf)
-    finite_outputs = outputs[np.isfinite(outputs)]
-    if finite_outputs.size == 0:
-        return np.array([])
-
-    total = float(finite_outputs.sum())
-    if finite_outputs.min() >= 0.0 and 0.99 <= total <= 1.01:
-        return outputs
-
-    shifted = outputs - np.max(outputs)
-    exp_outputs = np.exp(shifted)
-    exp_outputs = np.nan_to_num(exp_outputs, nan=0.0, posinf=0.0, neginf=0.0)
-    exp_total = float(exp_outputs.sum())
-    if exp_total <= 0.0:
-        return np.array([])
-
-    return exp_outputs / exp_total
+    return np.stack(frames, axis=0)
 
 
-def display_confidence(confidence):
-    if confidence <= 0.0:
-        return 0.0
-    if confidence >= 0.60:
-        return round(float(confidence), 4)
+def parse_landmark_upload(body):
+    if not body:
+        raise PredictionInputError("No landmark data uploaded")
+    if len(body) % FRAME_BYTES != 0:
+        raise PredictionInputError(
+            f"Landmark payload must be float32 frames of {ROWS_PER_FRAME}x{COORDINATES} values"
+        )
 
-    return round(0.68 + (float(confidence) / 0.60) * 0.13, 4)
+    frame_count = len(body) // FRAME_BYTES
+    if frame_count > MAX_LANDMARK_FRAMES:
+        raise PredictionInputError(
+            f"Recording is too long ({frame_count} frames, maximum {MAX_LANDMARK_FRAMES})"
+        )
+
+    frames = np.frombuffer(body, dtype="<f4").reshape(frame_count, ROWS_PER_FRAME, COORDINATES)
+    # Infinity is never a valid landmark; treat it as "not detected" like NaN.
+    return np.where(np.isfinite(frames), frames, np.nan).astype(np.float32)
 
 
 def get_prediction(model_input):
-    """Runs the TensorFlow Lite model to predict the sign from landmark data."""
-    if model_input is None or model_input.size == 0:
-        return "Unknown", 0.0  # Handle empty input case
-
+    """Runs the classifier and returns the top predictions, best first."""
+    load_model()
     with inference_lock:
-        prediction = prediction_fn(inputs=model_input)
+        outputs = [
+            np.asarray(prediction_fn(inputs=model_input)["outputs"], dtype=np.float64).reshape(-1)
+            for _ in range(INFERENCE_PASSES)
+        ]
 
-    outputs = normalize_model_outputs(prediction.get('outputs', None))
+    scores = np.mean(outputs, axis=0)
+    if scores.size != len(ORD2SIGN) or not np.all(np.isfinite(scores)):
+        app.logger.warning("Model returned unusable scores (size=%s)", scores.size)
+        return []
 
-    if outputs.size == 0:
-        app.logger.warning("Model returned no usable prediction scores")
-        return "Unknown", 0.0  # Handle missing model output
+    # The model ends in a softmax; renormalise only to remove float drift.
+    total = scores.sum()
+    if total > 0:
+        scores = scores / total
 
-    sign_ord = int(outputs.argmax())
-    sign = ORD2SIGN.get(sign_ord, "Unknown")
-    if sign == "Unknown":
-        app.logger.warning(
-            "Model returned label index %s, but only %s labels are configured",
-            sign_ord,
-            len(ORD2SIGN),
-        )
-    pred_conf = display_confidence(float(outputs[sign_ord])) if sign != "Unknown" else 0.0
+    top_indices = np.argsort(scores)[::-1][:TOP_K]
+    return [
+        {"sign": ORD2SIGN[int(index)], "confidence": round(float(scores[index]), 4)}
+        for index in top_indices
+    ]
 
-    return sign, pred_conf
+
+def prediction_response(frames, timing, started_at):
+    model_input = select_hand_frames(frames)
+    if model_input is None:
+        return jsonify({
+            "error": "No hands detected in the recording. Keep at least one hand clearly visible and try again."
+        }), 422
+
+    inference_started_at = time.perf_counter()
+    predictions = get_prediction(model_input)
+    finished_at = time.perf_counter()
+    if not predictions:
+        return jsonify({"error": "The model could not score this recording. Please try again."}), 500
+
+    timing["model_prediction_seconds"] = round(finished_at - inference_started_at, 3)
+    timing["total_seconds"] = round(finished_at - started_at, 3)
+    app.logger.info(
+        "Prediction %s (%.3f) from %s/%s hand frames in %.3fs",
+        predictions[0]["sign"],
+        predictions[0]["confidence"],
+        len(model_input),
+        len(frames),
+        timing["total_seconds"],
+    )
+    return jsonify({
+        "sign": predictions[0]["sign"],
+        "confidence": predictions[0]["confidence"],
+        "predictions": predictions,
+        "frames": {"received": int(len(frames)), "with_hands": int(len(model_input))},
+        "timing": timing,
+    })
+
+
+@app.route("/predict-landmarks", methods=["POST"])
+def predict_landmarks():
+    """Classifies landmarks extracted in the browser (float32 [frames, 543, 3])."""
+    started_at = time.perf_counter()
+    try:
+        frames = parse_landmark_upload(request.get_data(cache=False))
+    except PredictionInputError as error:
+        return jsonify({"error": str(error)}), 400
+
+    load_model()
+    return prediction_response(
+        frames,
+        {"parse_seconds": round(time.perf_counter() - started_at, 3)},
+        started_at,
+    )
 
 
 @app.route("/predict", methods=["POST"])
 def predict():
-    """Handles video upload, processing, prediction, and generates speech output."""
+    """Fallback: extracts landmarks from an uploaded clip on the server."""
     started_at = time.perf_counter()
-    app.logger.info("Prediction request received (content_length=%s)", request.content_length)
-    if "video" not in request.files:
+    file = request.files.get("video")
+    if file is None:
         return jsonify({"error": "No video uploaded"}), 400
 
-    load_ml_resources()
-    resources_loaded_at = time.perf_counter()
-
-    file = request.files["video"]
-    suffix = Path(file.filename or "").suffix or ".webm"
+    load_model()
+    suffix = Path(file.filename or "").suffix.lower()
+    if suffix not in {".webm", ".mp4", ".mov", ".mkv"}:
+        suffix = ".webm"
     video_path = os.path.join(UPLOAD_FOLDER, f"{uuid4().hex}{suffix}")
     file.save(video_path)
     saved_at = time.perf_counter()
 
     try:
-        model_input = process_video(video_path)
-        processed_at = time.perf_counter()
-
-        if model_input is None:
-            return jsonify({
-                "error": "No hands detected in the recording. Keep at least one hand clearly visible and try again."
-            }), 422
-
-        detected_sign, confidence = get_prediction(model_input)
-        predicted_at = time.perf_counter()
+        frames = process_video(video_path)
+    except PredictionInputError as error:
+        return jsonify({"error": str(error)}), 422
     finally:
         try:
             os.remove(video_path)
         except OSError:
             pass
 
-    response = {
-        "sign": detected_sign,
-        "confidence": confidence,
-        "timing": {
-            "resource_load_seconds": round(resources_loaded_at - started_at, 3),
-            "upload_save_seconds": round(saved_at - resources_loaded_at, 3),
+    processed_at = time.perf_counter()
+    return prediction_response(
+        frames,
+        {
+            "upload_save_seconds": round(saved_at - started_at, 3),
             "video_processing_seconds": round(processed_at - saved_at, 3),
-            "model_prediction_seconds": round(predicted_at - processed_at, 3),
-            "total_seconds": round(predicted_at - started_at, 3),
         },
-    }
-
-    if ENABLE_TTS:
-        try:
-            tts = gTTS(text=detected_sign, lang='en')
-            tts.save(audio_path)
-            response["audio_url"] = "/audio"
-        except Exception as error:
-            app.logger.warning("TTS generation failed: %s", error)
-
-    app.logger.info("Prediction completed in %.3fs", response["timing"]["total_seconds"])
-    return jsonify(response)
-
-
-@app.route("/audio", methods=["GET"])
-def get_audio():
-    """Serves the generated audio file for sign language translation."""
-    return send_file(audio_path, mimetype="audio/mpeg")
+        started_at,
+    )
 
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "model_loaded": prediction_fn is not None})
+    return jsonify({
+        "status": "ok",
+        "model_loaded": prediction_fn is not None,
+        "video_fallback_loaded": holistic is not None,
+    })
 
 
 @app.route("/warmup", methods=["GET"])
 def warmup():
-    """Loads and caches ML resources before the user submits a recording."""
+    """Loads the classifier before the user submits a recording."""
     started_at = time.perf_counter()
-    app.logger.info("Model warmup requested")
-    load_ml_resources()
+    load_model()
     elapsed = time.perf_counter() - started_at
-    app.logger.info("Model warmup completed in %.3fs", elapsed)
+    if elapsed > 0.05:
+        app.logger.info("Model warmup completed in %.3fs", elapsed)
     return jsonify({"status": "ready", "warmup_seconds": round(elapsed, 3)})
 
 
 # Keep service boot light so Render can accept /health requests immediately.
-# The ML resources are loaded once, only when the first /predict request arrives.
+# The classifier loads on /warmup (sent when the detection page opens) or on
+# the first prediction; MediaPipe loads only if the video fallback is used.
 
 
 if __name__ == "__main__":
