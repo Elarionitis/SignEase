@@ -80,6 +80,7 @@ interface RecordingSession {
   active: boolean;
   startedAt: number;
   handFrames: Float32Array[];
+  handFrameTimes: number[];
   trackedFrames: number;
   trackerFailed: boolean;
   trackerTooSlow: boolean;
@@ -541,8 +542,15 @@ const SignDetection: React.FC = () => {
         if (!frame || !session.active) continue;
 
         session.trackedFrames += 1;
-        if (frame.hasHands && session.handFrames.length < MAX_LANDMARK_FRAMES) {
+        // Timestamps must strictly increase for the server's resampling.
+        const lastTime = session.handFrameTimes[session.handFrameTimes.length - 1] ?? -Infinity;
+        if (
+          frame.hasHands &&
+          session.handFrames.length < MAX_LANDMARK_FRAMES &&
+          startedAt > lastTime
+        ) {
           session.handFrames.push(frame.values);
+          session.handFrameTimes.push(startedAt);
         }
         if (mountedRef.current) {
           setHandsVisible(frame.hasHands);
@@ -600,10 +608,17 @@ const SignDetection: React.FC = () => {
         return;
       } else if (enoughHandFrames && (trackingUsable || !videoBlob)) {
         mode = "on-device";
-        response = await requestPrediction("/predict-landmarks", packFrames(session.handFrames), {
-          signal: session.abort.signal,
-          headers: { "Content-Type": "application/octet-stream" },
-        });
+        response = await requestPrediction(
+          "/predict-landmarks",
+          packFrames(session.handFrames, session.handFrameTimes),
+          {
+            signal: session.abort.signal,
+            headers: {
+              "Content-Type": "application/octet-stream",
+              "X-Frame-Count": String(session.handFrames.length),
+            },
+          }
+        );
       } else if (videoBlob) {
         // Hand tracking was unavailable or too slow on this device.
         mode = "server";
@@ -672,6 +687,7 @@ const SignDetection: React.FC = () => {
         active: true,
         startedAt: performance.now(),
         handFrames: [],
+        handFrameTimes: [],
         trackedFrames: 0,
         trackerFailed: false,
         trackerTooSlow: false,

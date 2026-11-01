@@ -174,9 +174,17 @@ export function loadHolisticTracker() {
   return trackerPromise;
 }
 
-/** Packs frames as little-endian float32 [frames, 543, 3] for /predict-landmarks. */
-export function packFrames(frames: Float32Array[]) {
-  const packed = new Float32Array(frames.length * FRAME_VALUES);
+/**
+ * Packs frames as float32 [frames, 543, 3] followed by one float32 capture
+ * time (ms since the first frame) per frame, for /predict-landmarks. The
+ * server uses the times to resample the sequence to the model's 30 fps.
+ */
+export function packFrames(frames: Float32Array[], timesMs: number[]) {
+  const packed = new Float32Array(frames.length * (FRAME_VALUES + 1));
   frames.forEach((frame, index) => packed.set(frame, index * FRAME_VALUES));
+  const start = timesMs[0] ?? 0;
+  timesMs.forEach((time, index) => {
+    packed[frames.length * FRAME_VALUES + index] = time - start;
+  });
   return packed;
 }
