@@ -102,7 +102,7 @@ export default function HeroGeometricPage() {
 
 
   return (
-    <div className="bg-[#030303] min-h-screen">
+    <div className="bg-[#030303] min-h-screen overflow-x-hidden">
       <Background />
 
       {/* Loading overlay */}
@@ -141,9 +141,9 @@ export default function HeroGeometricPage() {
           <div className="absolute inset-0 bg-gradient-to-b from-black/90 via-black/50 to-transparent pointer-events-none" />
           <div className="absolute inset-0 backdrop-blur-[8px] backdrop-saturate-150 bg-black/5 pointer-events-none" />
 
-          <div className="relative z-10 flex items-center justify-between w-full px-6 min-h-[80px] py-4">
+          <div className="relative z-10 flex items-center justify-between w-full px-4 sm:px-6 min-h-[72px] sm:min-h-[80px] py-3 sm:py-4 gap-4">
             <motion.div
-              className="flex items-center gap-4"
+              className="flex items-center gap-4 shrink-0"
             >
               <Link href="/" className="relative flex items-center h-[48px] hover:opacity-80 transition-opacity">
                 <Image
@@ -154,7 +154,7 @@ export default function HeroGeometricPage() {
                   className="object-contain"
                 />
                 <span className={cn(
-                  "text-2xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-indigo-300 via-white/90 to-rose-300 ml-3 leading-relaxed tracking-wide overflow-visible py-2",
+                  "text-xl sm:text-2xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-indigo-300 via-white/90 to-rose-300 ml-3 leading-relaxed tracking-wide overflow-visible py-2",
                   pacifico.className
                 )}>
                   SignEase
@@ -163,28 +163,35 @@ export default function HeroGeometricPage() {
             </motion.div>
 
             <motion.div
-              className="flex gap-4 text-white/90"
+              className="flex gap-3 sm:gap-4 text-sm sm:text-base text-white/90"
             >
               <Link
-                href="/"
+                href="/sign-detection"
+                onMouseEnter={warmSignDetection}
                 className="hover:text-indigo-400 transition-all hover:scale-105"
               >
-                About
+                Detection
+              </Link>
+              <Link
+                href="/dictionary"
+                className="hover:text-indigo-400 transition-all hover:scale-105"
+              >
+                Dictionary
               </Link>
               <a
-                className="hover:text-indigo-400 transition-all hover:scale-105"
+                className="hidden md:inline hover:text-indigo-400 transition-all hover:scale-105"
                 href="#technology"
               >
                 Technology
               </a>
               <a
-                className="hover:text-indigo-400 transition-all hover:scale-105"
+                className="hidden md:inline hover:text-indigo-400 transition-all hover:scale-105"
                 href="#team"
               >
                 Team
               </a>
               <a
-                className="hover:text-indigo-400 transition-all hover:scale-105"
+                className="hidden md:inline hover:text-indigo-400 transition-all hover:scale-105"
                 href="#contact"
               >
                 Contact
