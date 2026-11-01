@@ -5,7 +5,7 @@ SignEase is a sign language recognition project with a Next.js frontend and a Py
 ## How prediction works
 
 1. While the user signs, the browser runs **MediaPipe Holistic on every camera frame** (WebAssembly + WebGL, self-hosted from `ISLRv6/public/mediapipe/`). Each frame becomes the 543 face/hand/pose landmarks the model was trained on.
-2. The frames are uploaded as a small binary tensor to `POST /predict-landmarks`, and the backend only runs the TensorFlow Lite classifier (about 0.1 s even on a small Render instance).
+2. The frames and their timestamps are uploaded as a small binary tensor to `POST /predict-landmarks`. The backend resamples them to the 30 fps the model was trained on, finds the part of the recording where the sign happens (leaving out raising, holding and lowering the hands), and runs the TensorFlow Lite classifier.
 3. If the device cannot run hand tracking fast enough (no WebGL2, very slow GPU), the page falls back to uploading the recorded clip to `POST /predict`, and the server extracts landmarks itself. This is slower on a shared CPU.
 
 Running MediaPipe on the server was the bottleneck in production: a free/starter Render CPU had to sample only a few frames to avoid timeouts, and the model's confidence dropped sharply with those sparse sequences (for example 74% vs 30% on a Kaggle sample). Tracking in the browser gives the model the full frame rate, as when running locally, at no server cost.
@@ -60,7 +60,7 @@ Optional backend environment variables:
 | --- | --- | --- |
 | `CORS_ORIGINS` | `*` | Comma-separated allowed origins, e.g. `https://your-app.vercel.app` |
 | `MAX_LANDMARK_FRAMES` | `600` | Longest landmark sequence accepted |
-| `INFERENCE_PASSES` | `3` | Model runs averaged per prediction (the model has a random op) |
+| `INFERENCE_PASSES` | `2` | Model runs averaged for the chosen segment (the model has a random op) |
 | `FRAME_SAMPLE_RATE` / `MAX_SAMPLED_FRAMES` | `2` / `48` | Video fallback: frame stride and cap |
 | `MAX_UPLOAD_MB` | `8` | Request size limit |
 
