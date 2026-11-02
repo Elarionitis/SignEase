@@ -17,6 +17,22 @@ loglevel = "info"
 preload_app = False
 # Periodically recycle the worker to release native MediaPipe/OpenCV
 # allocations left behind by the video fallback.
-max_requests = int(os.environ.get("GUNICORN_MAX_REQUESTS", "200"))
+max_requests = int(os.environ.get("GUNICORN_MAX_REQUESTS", "1000"))
 max_requests_jitter = int(os.environ.get("GUNICORN_MAX_REQUESTS_JITTER", "20"))
 worker_tmp_dir = "/dev/shm" if os.path.isdir("/dev/shm") else None
+
+
+def post_worker_init(worker):
+    """Load the model as soon as a worker starts (after boot, a Render wake-up
+    or a recycle), in the background so /health answers immediately."""
+    import threading
+
+    from backend import app, load_model
+
+    def load():
+        try:
+            load_model()
+        except Exception:
+            app.logger.exception("Background model load failed")
+
+    threading.Thread(target=load, name="model-preload", daemon=True).start()

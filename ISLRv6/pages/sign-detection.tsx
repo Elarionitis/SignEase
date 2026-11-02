@@ -2,11 +2,11 @@ import PixelCard from "@/components/PixelCard";
 import Background from "@/components/background";
 import { Button } from "@/components/ui/button";
 import { Slider } from "@/components/ui/slider";
+import { useBackendStatus } from "@/hooks/useBackendStatus";
 import { SLOW_FRAME_MS, useHolisticTracker, type TrackerStatus } from "@/hooks/useHolisticTracker";
 import {
   PredictionError,
   requestPrediction,
-  warmBackend,
   type PredictionResponse,
   type SignPrediction,
 } from "@/lib/api";
@@ -323,11 +323,9 @@ const SignDetection: React.FC = () => {
     };
   }, []);
 
-  // Wake the backend while the user is setting up, so the first prediction
-  // does not wait for a cold Render start.
-  useEffect(() => {
-    void warmBackend();
-  }, []);
+  // Wakes the backend while the user is setting up and keeps it awake, so
+  // the first prediction does not wait for a cold Render start.
+  const backendStatus = useBackendStatus();
 
   // Get voices and check if they're available
   useEffect(() => {
@@ -1152,7 +1150,7 @@ const SignDetection: React.FC = () => {
                         <div className="absolute bottom-0 right-0 w-6 h-6 border-b-2 border-r-2 border-white/20 rounded-br-lg z-10"></div>
                       </motion.div>
 
-                      <div className="mt-3 flex items-center justify-center gap-2 text-xs text-white/50" aria-live="polite">
+                      <div className="mt-3 flex flex-wrap items-center justify-center gap-x-2 gap-y-1 text-xs text-white/50" aria-live="polite">
                         <span
                           className={cn(
                             "h-2 w-2 rounded-full",
@@ -1164,6 +1162,22 @@ const SignDetection: React.FC = () => {
                           )}
                         />
                         {trackerLabel(trackerStatus)}
+                        <span className="text-white/20">•</span>
+                        <span
+                          className={cn(
+                            "h-2 w-2 rounded-full",
+                            backendStatus === "ready"
+                              ? "bg-emerald-400"
+                              : backendStatus === "waking"
+                                ? "bg-amber-400 animate-pulse"
+                                : "bg-rose-400"
+                          )}
+                        />
+                        {backendStatus === "ready"
+                          ? "Server ready"
+                          : backendStatus === "waking"
+                            ? "Waking up server…"
+                            : "Server unreachable, retrying…"}
                       </div>
 
                       <div className="mt-5 flex flex-wrap justify-center gap-4">
@@ -1338,6 +1352,12 @@ const SignDetection: React.FC = () => {
                               >
                                 AI model processing…
                               </motion.p>
+                              {backendStatus !== "ready" && (
+                                <p className="mt-3 max-w-xs text-center text-xs text-amber-200/80">
+                                  The prediction server is waking up after being idle. This first
+                                  result can take up to a minute; the next ones are instant.
+                                </p>
+                              )}
                             </div>
                           ) : phase === "error" ? (
                             <motion.div
