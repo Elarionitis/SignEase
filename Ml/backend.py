@@ -111,19 +111,22 @@ MIN_WINDOW_FRAMES = 8
 TRAINING_ASPECT_RATIO = 3 / 4
 DEFAULT_CAMERA_ASPECT_RATIO = 4 / 3
 
-# The model is underconfident (it was trained with smoothed labels): raw
-# scores around 0.6 were right ~90% of the time on real sign videos.
-# Temperature scaling (cross-validated on 120 videos) maps scores to how
-# often a prediction is actually correct; it never changes the ranking.
-CONFIDENCE_TEMPERATURE = env_float("CONFIDENCE_TEMPERATURE", 0.76, 0.1, 1.0)
+# The model is underconfident (it was trained with 0.25 label smoothing), so
+# confidence is temperature-scaled to match how often predictions are right
+# on real sign videos; it never changes the ranking. Fitted for the current
+# model on the 120 dictionary videos (10-fold cross-validated calibration
+# error 0.07, bootstrap 90% interval 0.83-0.94). Refit it with
+# training/calibrate.py whenever the model changes.
+CONFIDENCE_TEMPERATURE = env_float("CONFIDENCE_TEMPERATURE", 0.89, 0.1, 1.0)
 
 # Landmark uploads: ~30 fps for the 10 second maximum recording, with headroom.
 MAX_LANDMARK_FRAMES = env_int("MAX_LANDMARK_FRAMES", 600)
 MIN_HAND_FRAMES = env_int("MIN_HAND_FRAMES", 4)
 TOP_K = 3
-# The model contains a RANDOM_UNIFORM op, so repeated runs differ by a couple
-# of percent. The chosen segment is scored this many times and averaged.
-INFERENCE_PASSES = env_int("INFERENCE_PASSES", 2)
+# The current model is deterministic. Models exported before it randomly
+# dropped 25% of frames on every run; for those, set this to 2+ to average
+# several runs of the chosen segment.
+INFERENCE_PASSES = env_int("INFERENCE_PASSES", 1)
 
 # Video fallback. Holistic is the expensive step, so cap how many frames it
 # runs on; the cap still covers a 3 second clip at 15 fps.
@@ -180,11 +183,18 @@ def load_model():
 
         try:
             from tflite_runtime.interpreter import Interpreter
-        except ImportError as error:
-            raise RuntimeError(
-                "tflite-runtime is required for inference; install the pinned "
-                "dependency from requirements.txt"
-            ) from error
+        except ImportError:
+            # tflite-runtime has no macOS wheels; full TensorFlow works for
+            # local development.
+            try:
+                import tensorflow as tf
+
+                Interpreter = tf.lite.Interpreter
+            except ImportError as error:
+                raise RuntimeError(
+                    "tflite-runtime is required for inference; install the pinned "
+                    "dependency from requirements.txt"
+                ) from error
 
         labels = load_labels()
         model = Interpreter(
@@ -461,14 +471,23 @@ def parse_aspect_ratio(header):
     return aspect_ratio
 
 
-def get_prediction(frames):
-    """Scores the recording and returns the top predictions, best first.
+def prepare_frames(frames, timestamps_ms, aspect_ratio):
+    """Converts a recording to what the model was trained on: 3:4 portrait
+    coordinates at 30 fps."""
+    frames = to_training_aspect(frames, aspect_ratio)
+    if timestamps_ms is not None:
+        frames = resample_frames(frames, timestamps_ms)
+    return frames
+
+
+def score_recording(frames):
+    """Uncalibrated class probabilities for a prepared recording, and the
+    number of frames they came from.
 
     Every candidate window is scored once. The sign is the one with the
     highest average across windows (so a single odd window cannot pick it),
-    and its confidence comes from the window that shows it most clearly.
+    and the scores come from the window that shows it most clearly.
     """
-    load_model()
     windows = [
         model_input
         for model_input in (hand_frames_in(frames, window) for window in candidate_windows(frames))
@@ -479,18 +498,23 @@ def get_prediction(frames):
     sign_index = int(np.mean(window_scores, axis=0).argmax())
     best = int(np.argmax([scores[sign_index] for scores in window_scores]))
     outputs = [window_scores[best]] + [run_model(windows[best]) for _ in range(INFERENCE_PASSES - 1)]
+    return np.mean(outputs, axis=0), len(windows[best])
 
-    scores = np.mean(outputs, axis=0)
+
+def get_prediction(frames):
+    """Top predictions, best first, with calibrated confidence."""
+    load_model()
+    scores, frames_used = score_recording(frames)
     if scores.size != len(ORD2SIGN) or not np.all(np.isfinite(scores)):
         app.logger.warning("Model returned unusable scores (size=%s)", scores.size)
-        return []
+        return [], frames_used
 
     scores = calibrate(scores)
     top_indices = np.argsort(scores)[::-1][:TOP_K]
     return [
         {"sign": ORD2SIGN[int(index)], "confidence": round(float(scores[index]), 4)}
         for index in top_indices
-    ], len(windows[best])
+    ], frames_used
 
 
 def prediction_response(frames, timestamps_ms, aspect_ratio, timing, started_at):
@@ -501,10 +525,7 @@ def prediction_response(frames, timestamps_ms, aspect_ratio, timing, started_at)
         }), 422
 
     inference_started_at = time.perf_counter()
-    frames = to_training_aspect(frames, aspect_ratio)
-    if timestamps_ms is not None:
-        frames = resample_frames(frames, timestamps_ms)
-    predictions, frames_used = get_prediction(frames)
+    predictions, frames_used = get_prediction(prepare_frames(frames, timestamps_ms, aspect_ratio))
     finished_at = time.perf_counter()
     if not predictions:
         return jsonify({"error": "The model could not score this recording. Please try again."}), 500

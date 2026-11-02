@@ -10,7 +10,7 @@ SignEase is a sign language recognition project with a Next.js frontend and a Py
 Two corrections make webcam recordings match the training data:
 
 - **Frame shape.** The training videos are portrait phone recordings (about 3:4), and MediaPipe coordinates are fractions of the frame's width and height. The browser sends the camera's aspect ratio and the backend re-expresses the landmarks as a 3:4 frame. Without this, a 4:3 webcam squeezes every hand shape to about half its width.
-- **Calibrated confidence.** The model was trained with smoothed labels, so its raw scores rarely pass about 75% even when it is right. The backend applies temperature scaling (fitted on 120 sign videos) so the confidence shown matches how often predictions are actually correct.
+- **Calibrated confidence.** The model was trained with smoothed labels, so its raw scores rarely pass about 75% even when it is right. The backend applies temperature scaling (fitted on the 120 dictionary videos) so the confidence shown matches how often predictions are actually correct.
 3. If the device cannot run hand tracking fast enough (no WebGL2, very slow GPU), the page falls back to uploading the recorded clip to `POST /predict`, and the server extracts landmarks itself. This is slower on a shared CPU.
 
 Running MediaPipe on the server was the bottleneck in production: a free/starter Render CPU had to sample only a few frames to avoid timeouts, and the model's confidence dropped sharply with those sparse sequences (for example 74% vs 30% on a Kaggle sample). Tracking in the browser gives the model the full frame rate, as when running locally, at no server cost.
@@ -65,8 +65,8 @@ Optional backend environment variables:
 | --- | --- | --- |
 | `CORS_ORIGINS` | `*` | Comma-separated allowed origins, e.g. `https://your-app.vercel.app` |
 | `MAX_LANDMARK_FRAMES` | `600` | Longest landmark sequence accepted |
-| `CONFIDENCE_TEMPERATURE` | `0.76` | Confidence calibration (lower = sharper); `1` shows raw model scores |
-| `INFERENCE_PASSES` | `2` | Model runs averaged for the chosen segment (the model has a random op) |
+| `CONFIDENCE_TEMPERATURE` | `0.89` | Confidence calibration (lower = sharper); `1` shows raw model scores |
+| `INFERENCE_PASSES` | `1` | Model runs averaged for the chosen segment (only useful for models exported before the fine-tuned one, which dropped frames at random) |
 | `FRAME_SAMPLE_RATE` / `MAX_SAMPLED_FRAMES` | `2` / `48` | Video fallback: frame stride and cap |
 | `MAX_UPLOAD_MB` | `8` | Request size limit |
 
@@ -83,10 +83,12 @@ The ML code is based on isolated ASL recognition using the Google ASL Signs data
 
 The model recognizes common ASL concepts such as `hello`, `thankyou`, `mom`, `dad`, `water`, `food`, `book`, `yes`, `no`, `please`, and many more from the 250-sign dataset.
 
+The shipped `asl_model.tflite` is the original Kaggle-notebook transformer, rebuilt from its weights and fine-tuned to be robust to webcam recordings (aspect ratio, framing, raising and lowering the hands). On the 120 dictionary videos, which no model was trained on, it gets 60% top-1 and 68% top-3 through the backend pipeline. See `Ml/training/README.md` for how it was verified, trained, evaluated and calibrated, and how to reproduce it.
+
 ## Development Notes
 
 - Keep generated files, virtual environments, caches, and large local artifacts out of commits.
 - `Ml/env/`, `.next/`, cache folders, and saved videos are local development artifacts.
 - If backend model/data paths move, update the path constants near the top of `Ml/backend.py`.
 - Labels come from `Ml/ML_Code_ISL/data/sign_to_prediction_index_map.json`; the dictionary page uses the same map from `ISLRv6/data/`.
-- The reported confidence is the model's real softmax probability (averaged over a few runs), not a rescaled value.
+- The reported confidence is the model's softmax probability, temperature-scaled to match real accuracy (refit with `Ml/training/calibrate.py` whenever the model changes).
