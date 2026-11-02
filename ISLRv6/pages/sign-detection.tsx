@@ -39,7 +39,9 @@ const MIN_HAND_FRAMES = 4;
 // Below this tracking rate (slow GPU / software rendering) the on-device
 // sequence is too sparse, so the recorded clip is sent to the server instead.
 const MIN_TRACKED_FPS = 6;
-const LOW_CONFIDENCE = 0.25;
+// Confidence is calibrated on the server: below this, about half of the
+// predictions on real sign videos were wrong.
+const LOW_CONFIDENCE = 0.4;
 const VIDEO_CONSTRAINTS: MediaTrackConstraints = {
   width: { ideal: 640 },
   height: { ideal: 480 },
@@ -81,6 +83,7 @@ interface RecordingSession {
   startedAt: number;
   handFrames: Float32Array[];
   handFrameTimes: number[];
+  frameAspect: number;
   trackedFrames: number;
   trackerFailed: boolean;
   trackerTooSlow: boolean;
@@ -616,6 +619,9 @@ const SignDetection: React.FC = () => {
             headers: {
               "Content-Type": "application/octet-stream",
               "X-Frame-Count": String(session.handFrames.length),
+              // Landmarks are fractions of the frame size, so the server
+              // needs the frame shape to undo the stretching.
+              "X-Frame-Aspect": session.frameAspect.toFixed(4),
             },
           }
         );
@@ -688,6 +694,7 @@ const SignDetection: React.FC = () => {
         startedAt: performance.now(),
         handFrames: [],
         handFrameTimes: [],
+        frameAspect: video.videoWidth / video.videoHeight,
         trackedFrames: 0,
         trackerFailed: false,
         trackerTooSlow: false,
