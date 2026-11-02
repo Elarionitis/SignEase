@@ -17,6 +17,7 @@ import logging
 import os
 import threading
 import time
+import warnings
 from pathlib import Path
 from uuid import uuid4
 
@@ -81,14 +82,26 @@ LANDMARK_LAYOUT = (
 )
 LEFT_HAND_ROWS = slice(468, 489)
 RIGHT_HAND_ROWS = slice(522, 543)
+LEFT_SHOULDER_ROW = 468 + 21 + 11
+RIGHT_SHOULDER_ROW = 468 + 21 + 12
+
+# The model was trained on ~30 fps clips trimmed to the sign itself. Recordings
+# are resampled to this rate by timestamp, and the signing segment is found
+# before scoring, because slower tracking and the time spent raising, holding
+# and lowering the hands cut the model's confidence by more than half.
+MODEL_FPS = 30
+# Gaps in hand tracking longer than this are left empty instead of being
+# bridged with invented motion.
+MAX_INTERPOLATION_GAP_SECONDS = 0.25
+MIN_WINDOW_FRAMES = 8
 
 # Landmark uploads: ~30 fps for the 10 second maximum recording, with headroom.
 MAX_LANDMARK_FRAMES = env_int("MAX_LANDMARK_FRAMES", 600)
-MIN_HAND_FRAMES = env_int("MIN_HAND_FRAMES", 2)
+MIN_HAND_FRAMES = env_int("MIN_HAND_FRAMES", 4)
 TOP_K = 3
 # The model contains a RANDOM_UNIFORM op, so repeated runs differ by a couple
-# of percent. Averaging a few ~40 ms passes keeps the reported confidence stable.
-INFERENCE_PASSES = env_int("INFERENCE_PASSES", 3)
+# of percent. The chosen segment is scored this many times and averaged.
+INFERENCE_PASSES = env_int("INFERENCE_PASSES", 2)
 
 # Video fallback. Holistic is the expensive step, so cap how many frames it
 # runs on; the cap still covers a 3 second clip at 15 fps.
@@ -213,12 +226,75 @@ def hand_frame_mask(frames):
     return left | right
 
 
-def select_hand_frames(frames):
-    """Keeps only frames with a visible hand; the model scores signs from hand motion."""
-    hand_frames = frames[hand_frame_mask(frames)]
-    if len(hand_frames) < MIN_HAND_FRAMES:
-        return None
-    return np.ascontiguousarray(hand_frames, dtype=np.float32)
+def resample_frames(frames, timestamps_ms, fps=MODEL_FPS):
+    """Linearly interpolates frames onto a uniform ``fps`` time grid."""
+    times = (np.asarray(timestamps_ms, dtype=np.float64) - timestamps_ms[0]) / 1000.0
+    count = int(round(times[-1] * fps)) + 1
+    if len(frames) < 2 or count < 2:
+        return frames
+
+    grid = np.arange(count) / fps
+    before = np.clip(np.searchsorted(times, grid, side="right") - 1, 0, len(times) - 1)
+    after = np.minimum(before + 1, len(times) - 1)
+    gap = times[after] - times[before]
+    weight = np.where(gap > 0, (grid - times[before]) / np.where(gap > 0, gap, 1), 0.0)
+    weight = np.clip(weight, 0.0, 1.0)[:, None, None]
+
+    blended = frames[before] * (1 - weight) + frames[after] * weight
+    nearest = np.where(weight < 0.5, frames[before], frames[after])
+    # Where one side is missing (e.g. a hand appears), use the nearest frame.
+    resampled = np.where(np.isfinite(blended), blended, nearest)
+
+    # Don't bridge long tracking gaps with made-up hand motion.
+    distance = np.minimum(grid - times[before], times[after] - grid)
+    long_gap = (gap > MAX_INTERPOLATION_GAP_SECONDS) & (distance > 1.0 / fps)
+    resampled[long_gap, LEFT_HAND_ROWS] = np.nan
+    resampled[long_gap, RIGHT_HAND_ROWS] = np.nan
+    return resampled.astype(np.float32)
+
+
+def hand_motion(frames):
+    """Per-frame hand speed, in shoulder widths per frame, lightly smoothed."""
+    hands = np.concatenate([frames[:, LEFT_HAND_ROWS, :2], frames[:, RIGHT_HAND_ROWS, :2]], axis=1)
+    shoulders = frames[:, LEFT_SHOULDER_ROW, :2] - frames[:, RIGHT_SHOULDER_ROW, :2]
+    # Frames without hands or shoulders are all-NaN slices; that's expected.
+    with warnings.catch_warnings(), np.errstate(all="ignore"):
+        warnings.simplefilter("ignore", RuntimeWarning)
+        scale = np.nanmedian(np.linalg.norm(shoulders, axis=1))
+        if not np.isfinite(scale) or scale < 0.02:
+            scale = 0.25
+        speed = np.nanmean(np.linalg.norm(np.diff(hands, axis=0), axis=2), axis=1) / scale
+    speed = np.concatenate([[0.0], np.nan_to_num(speed)])
+    return np.convolve(speed, np.ones(5) / 5, mode="same")
+
+
+def candidate_windows(frames):
+    """Frame ranges that may contain the sign: the whole span with hands, the
+    span with clear hand motion, and shorter windows inside it (so raising or
+    lowering the hands can be left out)."""
+    hand_indices = np.flatnonzero(hand_frame_mask(frames))
+    start, end = int(hand_indices[0]), int(hand_indices[-1]) + 1
+    windows = {(start, end)}
+
+    motion = hand_motion(frames)[start:end]
+    if motion.max() > 0:
+        active = np.flatnonzero(motion > 0.2 * motion.max()) + start
+        active_start, active_end = int(active[0]), int(active[-1]) + 1
+        windows.add((max(start, active_start - 3), min(end, active_end + 3)))
+        length = active_end - active_start
+        for fraction in (0.75, 0.5):
+            size = max(12, int(length * fraction))
+            if size >= length:
+                continue
+            for offset in np.linspace(active_start, active_end - size, 3).astype(int):
+                windows.add((int(offset), int(offset) + size))
+
+    return sorted(windows)
+
+
+def hand_frames_in(frames, window):
+    selected = frames[window[0]:window[1]]
+    return np.ascontiguousarray(selected[hand_frame_mask(selected)], dtype=np.float32)
 
 
 def landmarks_to_frame_array(results):
@@ -250,7 +326,11 @@ def process_video(video_path):
     if not cap.isOpened():
         raise PredictionInputError("The recording could not be decoded. Please record again.")
 
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if not np.isfinite(fps) or not 5 <= fps <= 120:
+        fps = MODEL_FPS
     frames = []
+    timestamps = []
     frame_index = 0
     try:
         with holistic_lock:
@@ -271,6 +351,7 @@ def process_video(video_path):
                     image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
                     image.flags.writeable = False
                     frames.append(landmarks_to_frame_array(holistic.process(image)))
+                    timestamps.append(frame_index * 1000.0 / fps)
 
                 frame_index += 1
     finally:
@@ -279,36 +360,71 @@ def process_video(video_path):
     if not frames:
         raise PredictionInputError("The recording did not contain any video frames. Please record again.")
 
-    return np.stack(frames, axis=0)
+    return np.stack(frames, axis=0), np.asarray(timestamps)
 
 
-def parse_landmark_upload(body):
+def parse_landmark_upload(body, frame_count_header):
+    """Parses float32 frames [N, 543, 3], optionally followed by N float32
+    capture timestamps in milliseconds (sent with an X-Frame-Count header)."""
     if not body:
         raise PredictionInputError("No landmark data uploaded")
-    if len(body) % FRAME_BYTES != 0:
+
+    timestamps = None
+    if frame_count_header:
+        try:
+            frame_count = int(frame_count_header)
+        except ValueError:
+            raise PredictionInputError("X-Frame-Count must be an integer") from None
+        if frame_count < 1 or len(body) != frame_count * (FRAME_BYTES + 4):
+            raise PredictionInputError("Landmark payload size does not match X-Frame-Count")
+    elif len(body) % FRAME_BYTES == 0:
+        frame_count = len(body) // FRAME_BYTES
+    else:
         raise PredictionInputError(
             f"Landmark payload must be float32 frames of {ROWS_PER_FRAME}x{COORDINATES} values"
         )
 
-    frame_count = len(body) // FRAME_BYTES
     if frame_count > MAX_LANDMARK_FRAMES:
         raise PredictionInputError(
             f"Recording is too long ({frame_count} frames, maximum {MAX_LANDMARK_FRAMES})"
         )
 
-    frames = np.frombuffer(body, dtype="<f4").reshape(frame_count, ROWS_PER_FRAME, COORDINATES)
+    values = np.frombuffer(body, dtype="<f4")
+    frames = values[:frame_count * FRAME_VALUES].reshape(frame_count, ROWS_PER_FRAME, COORDINATES)
     # Infinity is never a valid landmark; treat it as "not detected" like NaN.
-    return np.where(np.isfinite(frames), frames, np.nan).astype(np.float32)
+    frames = np.where(np.isfinite(frames), frames, np.nan).astype(np.float32)
+
+    if frame_count_header:
+        timestamps = values[frame_count * FRAME_VALUES:].astype(np.float64)
+        if not np.all(np.isfinite(timestamps)) or np.any(np.diff(timestamps) <= 0):
+            raise PredictionInputError("Frame timestamps must be finite and increasing")
+    return frames, timestamps
 
 
-def get_prediction(model_input):
-    """Runs the classifier and returns the top predictions, best first."""
-    load_model()
+def run_model(model_input):
     with inference_lock:
-        outputs = [
-            np.asarray(prediction_fn(inputs=model_input)["outputs"], dtype=np.float64).reshape(-1)
-            for _ in range(INFERENCE_PASSES)
-        ]
+        outputs = prediction_fn(inputs=model_input)["outputs"]
+    return np.asarray(outputs, dtype=np.float64).reshape(-1)
+
+
+def get_prediction(frames):
+    """Scores the recording and returns the top predictions, best first.
+
+    Every candidate window is scored once. The sign is the one with the
+    highest average across windows (so a single odd window cannot pick it),
+    and its confidence comes from the window that shows it most clearly.
+    """
+    load_model()
+    windows = [
+        model_input
+        for model_input in (hand_frames_in(frames, window) for window in candidate_windows(frames))
+        if len(model_input) >= MIN_WINDOW_FRAMES
+    ] or [hand_frames_in(frames, (0, len(frames)))]
+
+    window_scores = [run_model(model_input) for model_input in windows]
+    sign_index = int(np.mean(window_scores, axis=0).argmax())
+    best = int(np.argmax([scores[sign_index] for scores in window_scores]))
+    outputs = [window_scores[best]] + [run_model(windows[best]) for _ in range(INFERENCE_PASSES - 1)]
 
     scores = np.mean(outputs, axis=0)
     if scores.size != len(ORD2SIGN) or not np.all(np.isfinite(scores)):
@@ -324,18 +440,20 @@ def get_prediction(model_input):
     return [
         {"sign": ORD2SIGN[int(index)], "confidence": round(float(scores[index]), 4)}
         for index in top_indices
-    ]
+    ], len(windows[best])
 
 
-def prediction_response(frames, timing, started_at):
-    model_input = select_hand_frames(frames)
-    if model_input is None:
+def prediction_response(frames, timestamps_ms, timing, started_at):
+    received = len(frames)
+    if int(hand_frame_mask(frames).sum()) < MIN_HAND_FRAMES:
         return jsonify({
             "error": "No hands detected in the recording. Keep at least one hand clearly visible and try again."
         }), 422
 
     inference_started_at = time.perf_counter()
-    predictions = get_prediction(model_input)
+    if timestamps_ms is not None:
+        frames = resample_frames(frames, timestamps_ms)
+    predictions, frames_used = get_prediction(frames)
     finished_at = time.perf_counter()
     if not predictions:
         return jsonify({"error": "The model could not score this recording. Please try again."}), 500
@@ -343,18 +461,18 @@ def prediction_response(frames, timing, started_at):
     timing["model_prediction_seconds"] = round(finished_at - inference_started_at, 3)
     timing["total_seconds"] = round(finished_at - started_at, 3)
     app.logger.info(
-        "Prediction %s (%.3f) from %s/%s hand frames in %.3fs",
+        "Prediction %s (%.3f) from %s of %s frames in %.3fs",
         predictions[0]["sign"],
         predictions[0]["confidence"],
-        len(model_input),
-        len(frames),
+        frames_used,
+        received,
         timing["total_seconds"],
     )
     return jsonify({
         "sign": predictions[0]["sign"],
         "confidence": predictions[0]["confidence"],
         "predictions": predictions,
-        "frames": {"received": int(len(frames)), "with_hands": int(len(model_input))},
+        "frames": {"received": int(received), "used": int(frames_used)},
         "timing": timing,
     })
 
@@ -364,13 +482,16 @@ def predict_landmarks():
     """Classifies landmarks extracted in the browser (float32 [frames, 543, 3])."""
     started_at = time.perf_counter()
     try:
-        frames = parse_landmark_upload(request.get_data(cache=False))
+        frames, timestamps = parse_landmark_upload(
+            request.get_data(cache=False), request.headers.get("X-Frame-Count")
+        )
     except PredictionInputError as error:
         return jsonify({"error": str(error)}), 400
 
     load_model()
     return prediction_response(
         frames,
+        timestamps,
         {"parse_seconds": round(time.perf_counter() - started_at, 3)},
         started_at,
     )
@@ -393,7 +514,7 @@ def predict():
     saved_at = time.perf_counter()
 
     try:
-        frames = process_video(video_path)
+        frames, timestamps = process_video(video_path)
     except PredictionInputError as error:
         return jsonify({"error": str(error)}), 422
     finally:
@@ -405,6 +526,7 @@ def predict():
     processed_at = time.perf_counter()
     return prediction_response(
         frames,
+        timestamps,
         {
             "upload_save_seconds": round(saved_at - started_at, 3),
             "video_processing_seconds": round(processed_at - saved_at, 3),
