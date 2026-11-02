@@ -1,0 +1,26 @@
+# Render's free instances sleep after 15 minutes without traffic, and the
+# first request after that waits up to a minute for the server to wake up.
+# This pings the backend so it stays ready. Set the repository variable
+# BACKEND_URL (Settings -> Secrets and variables -> Actions -> Variables),
+# e.g. https://your-backend.onrender.com. Without it the job does nothing.
+name: Keep backend awake
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Ping backend
+        env:
+          BACKEND_URL: ${{ vars.BACKEND_URL }}
+        run: |
+          if [ -z "$BACKEND_URL" ]; then
+            echo "BACKEND_URL is not set; skipping."
+            exit 0
+          fi
+          curl --fail --silent --show-error --max-time 120 --retry 2 "${BACKEND_URL%/}/warmup"

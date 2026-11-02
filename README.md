@@ -6,6 +6,11 @@ SignEase is a sign language recognition project with a Next.js frontend and a Py
 
 1. While the user signs, the browser runs **MediaPipe Holistic on every camera frame** (WebAssembly + WebGL, self-hosted from `ISLRv6/public/mediapipe/`). Each frame becomes the 543 face/hand/pose landmarks the model was trained on.
 2. The frames and their timestamps are uploaded as a small binary tensor to `POST /predict-landmarks`. The backend resamples them to the 30 fps the model was trained on, finds the part of the recording where the sign happens (leaving out raising, holding and lowering the hands), and runs the TensorFlow Lite classifier.
+
+Two corrections make webcam recordings match the training data:
+
+- **Frame shape.** The training videos are portrait phone recordings (about 3:4), and MediaPipe coordinates are fractions of the frame's width and height. The browser sends the camera's aspect ratio and the backend re-expresses the landmarks as a 3:4 frame. Without this, a 4:3 webcam squeezes every hand shape to about half its width.
+- **Calibrated confidence.** The model was trained with smoothed labels, so its raw scores rarely pass about 75% even when it is right. The backend applies temperature scaling (fitted on 120 sign videos) so the confidence shown matches how often predictions are actually correct.
 3. If the device cannot run hand tracking fast enough (no WebGL2, very slow GPU), the page falls back to uploading the recorded clip to `POST /predict`, and the server extracts landmarks itself. This is slower on a shared CPU.
 
 Running MediaPipe on the server was the bottleneck in production: a free/starter Render CPU had to sample only a few frames to avoid timeouts, and the model's confidence dropped sharply with those sparse sequences (for example 74% vs 30% on a Kaggle sample). Tracking in the browser gives the model the full frame rate, as when running locally, at no server cost.
@@ -60,9 +65,14 @@ Optional backend environment variables:
 | --- | --- | --- |
 | `CORS_ORIGINS` | `*` | Comma-separated allowed origins, e.g. `https://your-app.vercel.app` |
 | `MAX_LANDMARK_FRAMES` | `600` | Longest landmark sequence accepted |
+| `CONFIDENCE_TEMPERATURE` | `0.76` | Confidence calibration (lower = sharper); `1` shows raw model scores |
 | `INFERENCE_PASSES` | `2` | Model runs averaged for the chosen segment (the model has a random op) |
 | `FRAME_SAMPLE_RATE` / `MAX_SAMPLED_FRAMES` | `2` / `48` | Video fallback: frame stride and cap |
 | `MAX_UPLOAD_MB` | `8` | Request size limit |
+
+## Keeping the backend awake
+
+Render's free instances sleep after 15 minutes without traffic, and the first prediction after that waits up to a minute. The detection page shows when the server is waking up and pings it while the page is open. To keep it awake all the time, set the repository variable `BACKEND_URL` (Settings → Secrets and variables → Actions → Variables) to the backend URL; the `Keep backend awake` workflow then pings it every 10 minutes.
 
 ## ML Model Notes
 
