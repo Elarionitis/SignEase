@@ -51,3 +51,10 @@ ISLRv6 - Copy/ISLRv6/output_*.mp3
 ISLRv6 - Copy/ISLRv6/public/TechStackVideos/Ml/env/
 Ml/.cache/
 Ml/env/
+
+# Kaggle ASL Signs landmark data and fine-tuning artifacts (see Ml/training/README.md)
+Ml/ML_Code_ISL/data/train_landmark_files.zip
+Ml/ML_Code_ISL/data/train_landmark_files/
+Ml/training/cache/
+Ml/training/runs/
+Ml/training/*.npz

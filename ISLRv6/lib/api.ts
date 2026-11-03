@@ -21,13 +21,35 @@ export class PredictionError extends Error {
   }
 }
 
+export type BackendStatus = "waking" | "ready" | "offline";
+
+let backendStatus: BackendStatus = "waking";
+const statusListeners = new Set<(status: BackendStatus) => void>();
 let warmupPromise: Promise<void> | null = null;
 
+function setBackendStatus(status: BackendStatus) {
+  if (status === backendStatus) return;
+  backendStatus = status;
+  statusListeners.forEach((listener) => listener(status));
+}
+
+export function getBackendStatus() {
+  return backendStatus;
+}
+
+export function subscribeBackendStatus(listener: (status: BackendStatus) => void) {
+  statusListeners.add(listener);
+  return () => {
+    statusListeners.delete(listener);
+  };
+}
+
 /**
- * Wakes the backend (Render free instances sleep) and loads the classifier.
- * Deduplicated per page load; failures are retried on the next call.
+ * Wakes the backend (Render free instances sleep after 15 idle minutes, and
+ * waking takes up to a minute) and loads the classifier. Deduplicated while
+ * in flight; failures are retried on the next call.
  */
-export function warmBackend(timeoutMs = 60_000) {
+export function warmBackend(timeoutMs = 90_000) {
   if (warmupPromise) return warmupPromise;
 
   const controller = new AbortController();
@@ -35,15 +57,19 @@ export function warmBackend(timeoutMs = 60_000) {
   warmupPromise = fetch(`${API_BASE_URL}/warmup`, { signal: controller.signal })
     .then((response) => {
       if (!response.ok) throw new Error(`Model warmup failed (${response.status})`);
+      setBackendStatus("ready");
     })
     .catch((error: unknown) => {
-      warmupPromise = null;
+      setBackendStatus("offline");
       console.warn("[SignEase] Backend warmup failed", {
         url: API_BASE_URL,
         error: error instanceof Error ? error.message : error,
       });
     })
-    .finally(() => window.clearTimeout(timeoutId));
+    .finally(() => {
+      window.clearTimeout(timeoutId);
+      warmupPromise = null;
+    });
 
   return warmupPromise;
 }
@@ -86,6 +112,9 @@ export async function requestPrediction(
       response.status
     );
   }
+
+  // Any answer, even an error, means the server is awake.
+  setBackendStatus("ready");
 
   if (!data || typeof data.sign !== "string") {
     throw new PredictionError("The server returned an invalid response. Please try again.");

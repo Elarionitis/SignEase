@@ -45,6 +45,14 @@ def env_int(name, default, minimum=1):
         return default
 
 
+def env_float(name, default, minimum, maximum):
+    try:
+        value = float(os.environ.get(name, default))
+    except ValueError:
+        return default
+    return min(maximum, max(minimum, value)) if np.isfinite(value) else default
+
+
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = env_int("MAX_UPLOAD_MB", 8) * 1024 * 1024
 
@@ -95,13 +103,30 @@ MODEL_FPS = 30
 MAX_INTERPOLATION_GAP_SECONDS = 0.25
 MIN_WINDOW_FRAMES = 8
 
+# MediaPipe coordinates are fractions of the frame's width and height, so hand
+# shapes depend on the frame's aspect ratio. The training videos are portrait
+# phone recordings (about 3:4); a 4:3 webcam squeezes every shape to ~56% of
+# its width, which cut the correct sign's probability ~6x in testing.
+# Coordinates are re-expressed as if the frame were a centred 3:4 crop.
+TRAINING_ASPECT_RATIO = 3 / 4
+DEFAULT_CAMERA_ASPECT_RATIO = 4 / 3
+
+# The model is underconfident (it was trained with 0.25 label smoothing), so
+# confidence is temperature-scaled to match how often predictions are right
+# on real sign videos; it never changes the ranking. Fitted for the current
+# model on the 120 dictionary videos (10-fold cross-validated calibration
+# error 0.07, bootstrap 90% interval 0.83-0.94). Refit it with
+# training/calibrate.py whenever the model changes.
+CONFIDENCE_TEMPERATURE = env_float("CONFIDENCE_TEMPERATURE", 0.89, 0.1, 1.0)
+
 # Landmark uploads: ~30 fps for the 10 second maximum recording, with headroom.
 MAX_LANDMARK_FRAMES = env_int("MAX_LANDMARK_FRAMES", 600)
 MIN_HAND_FRAMES = env_int("MIN_HAND_FRAMES", 4)
 TOP_K = 3
-# The model contains a RANDOM_UNIFORM op, so repeated runs differ by a couple
-# of percent. The chosen segment is scored this many times and averaged.
-INFERENCE_PASSES = env_int("INFERENCE_PASSES", 2)
+# The current model is deterministic. Models exported before it randomly
+# dropped 25% of frames on every run; for those, set this to 2+ to average
+# several runs of the chosen segment.
+INFERENCE_PASSES = env_int("INFERENCE_PASSES", 1)
 
 # Video fallback. Holistic is the expensive step, so cap how many frames it
 # runs on; the cap still covers a 3 second clip at 15 fps.
@@ -158,11 +183,18 @@ def load_model():
 
         try:
             from tflite_runtime.interpreter import Interpreter
-        except ImportError as error:
-            raise RuntimeError(
-                "tflite-runtime is required for inference; install the pinned "
-                "dependency from requirements.txt"
-            ) from error
+        except ImportError:
+            # tflite-runtime has no macOS wheels; full TensorFlow works for
+            # local development.
+            try:
+                import tensorflow as tf
+
+                Interpreter = tf.lite.Interpreter
+            except ImportError as error:
+                raise RuntimeError(
+                    "tflite-runtime is required for inference; install the pinned "
+                    "dependency from requirements.txt"
+                ) from error
 
         labels = load_labels()
         model = Interpreter(
@@ -253,6 +285,23 @@ def resample_frames(frames, timestamps_ms, fps=MODEL_FPS):
     return resampled.astype(np.float32)
 
 
+def to_training_aspect(frames, aspect_ratio):
+    """Rescales x so landmarks match a 3:4 portrait frame of the same height."""
+    if not np.isfinite(aspect_ratio) or abs(aspect_ratio - TRAINING_ASPECT_RATIO) < 1e-3:
+        return frames
+    converted = frames.copy()
+    converted[..., 0] = 0.5 + (converted[..., 0] - 0.5) * (aspect_ratio / TRAINING_ASPECT_RATIO)
+    return converted
+
+
+def calibrate(scores):
+    """Temperature-scales softmax probabilities."""
+    logits = np.log(np.clip(scores, 1e-12, None)) / CONFIDENCE_TEMPERATURE
+    logits -= logits.max()
+    calibrated = np.exp(logits)
+    return calibrated / calibrated.sum()
+
+
 def hand_motion(frames):
     """Per-frame hand speed, in shoulder widths per frame, lightly smoothed."""
     hands = np.concatenate([frames[:, LEFT_HAND_ROWS, :2], frames[:, RIGHT_HAND_ROWS, :2]], axis=1)
@@ -331,6 +380,7 @@ def process_video(video_path):
         fps = MODEL_FPS
     frames = []
     timestamps = []
+    aspect_ratio = DEFAULT_CAMERA_ASPECT_RATIO
     frame_index = 0
     try:
         with holistic_lock:
@@ -341,6 +391,7 @@ def process_video(video_path):
 
                 if frame_index % FRAME_SAMPLE_RATE == 0:
                     height, width = image.shape[:2]
+                    aspect_ratio = width / height
                     if width > MAX_VIDEO_FRAME_WIDTH:
                         scale = MAX_VIDEO_FRAME_WIDTH / width
                         image = cv2.resize(
@@ -360,7 +411,7 @@ def process_video(video_path):
     if not frames:
         raise PredictionInputError("The recording did not contain any video frames. Please record again.")
 
-    return np.stack(frames, axis=0), np.asarray(timestamps)
+    return np.stack(frames, axis=0), np.asarray(timestamps), aspect_ratio
 
 
 def parse_landmark_upload(body, frame_count_header):
@@ -407,14 +458,36 @@ def run_model(model_input):
     return np.asarray(outputs, dtype=np.float64).reshape(-1)
 
 
-def get_prediction(frames):
-    """Scores the recording and returns the top predictions, best first.
+def parse_aspect_ratio(header):
+    """Camera frame width / height, sent by the browser as X-Frame-Aspect."""
+    if not header:
+        return DEFAULT_CAMERA_ASPECT_RATIO
+    try:
+        aspect_ratio = float(header)
+    except ValueError:
+        raise PredictionInputError("X-Frame-Aspect must be a number") from None
+    if not np.isfinite(aspect_ratio) or not 0.2 <= aspect_ratio <= 5:
+        raise PredictionInputError("X-Frame-Aspect must be between 0.2 and 5")
+    return aspect_ratio
+
+
+def prepare_frames(frames, timestamps_ms, aspect_ratio):
+    """Converts a recording to what the model was trained on: 3:4 portrait
+    coordinates at 30 fps."""
+    frames = to_training_aspect(frames, aspect_ratio)
+    if timestamps_ms is not None:
+        frames = resample_frames(frames, timestamps_ms)
+    return frames
+
+
+def score_recording(frames):
+    """Uncalibrated class probabilities for a prepared recording, and the
+    number of frames they came from.
 
     Every candidate window is scored once. The sign is the one with the
     highest average across windows (so a single odd window cannot pick it),
-    and its confidence comes from the window that shows it most clearly.
+    and the scores come from the window that shows it most clearly.
     """
-    load_model()
     windows = [
         model_input
         for model_input in (hand_frames_in(frames, window) for window in candidate_windows(frames))
@@ -425,25 +498,26 @@ def get_prediction(frames):
     sign_index = int(np.mean(window_scores, axis=0).argmax())
     best = int(np.argmax([scores[sign_index] for scores in window_scores]))
     outputs = [window_scores[best]] + [run_model(windows[best]) for _ in range(INFERENCE_PASSES - 1)]
+    return np.mean(outputs, axis=0), len(windows[best])
 
-    scores = np.mean(outputs, axis=0)
+
+def get_prediction(frames):
+    """Top predictions, best first, with calibrated confidence."""
+    load_model()
+    scores, frames_used = score_recording(frames)
     if scores.size != len(ORD2SIGN) or not np.all(np.isfinite(scores)):
         app.logger.warning("Model returned unusable scores (size=%s)", scores.size)
-        return []
+        return [], frames_used
 
-    # The model ends in a softmax; renormalise only to remove float drift.
-    total = scores.sum()
-    if total > 0:
-        scores = scores / total
-
+    scores = calibrate(scores)
     top_indices = np.argsort(scores)[::-1][:TOP_K]
     return [
         {"sign": ORD2SIGN[int(index)], "confidence": round(float(scores[index]), 4)}
         for index in top_indices
-    ], len(windows[best])
+    ], frames_used
 
 
-def prediction_response(frames, timestamps_ms, timing, started_at):
+def prediction_response(frames, timestamps_ms, aspect_ratio, timing, started_at):
     received = len(frames)
     if int(hand_frame_mask(frames).sum()) < MIN_HAND_FRAMES:
         return jsonify({
@@ -451,9 +525,7 @@ def prediction_response(frames, timestamps_ms, timing, started_at):
         }), 422
 
     inference_started_at = time.perf_counter()
-    if timestamps_ms is not None:
-        frames = resample_frames(frames, timestamps_ms)
-    predictions, frames_used = get_prediction(frames)
+    predictions, frames_used = get_prediction(prepare_frames(frames, timestamps_ms, aspect_ratio))
     finished_at = time.perf_counter()
     if not predictions:
         return jsonify({"error": "The model could not score this recording. Please try again."}), 500
@@ -485,6 +557,7 @@ def predict_landmarks():
         frames, timestamps = parse_landmark_upload(
             request.get_data(cache=False), request.headers.get("X-Frame-Count")
         )
+        aspect_ratio = parse_aspect_ratio(request.headers.get("X-Frame-Aspect"))
     except PredictionInputError as error:
         return jsonify({"error": str(error)}), 400
 
@@ -492,6 +565,7 @@ def predict_landmarks():
     return prediction_response(
         frames,
         timestamps,
+        aspect_ratio,
         {"parse_seconds": round(time.perf_counter() - started_at, 3)},
         started_at,
     )
@@ -514,7 +588,7 @@ def predict():
     saved_at = time.perf_counter()
 
     try:
-        frames, timestamps = process_video(video_path)
+        frames, timestamps, aspect_ratio = process_video(video_path)
     except PredictionInputError as error:
         return jsonify({"error": str(error)}), 422
     finally:
@@ -527,6 +601,7 @@ def predict():
     return prediction_response(
         frames,
         timestamps,
+        aspect_ratio,
         {
             "upload_save_seconds": round(saved_at - started_at, 3),
             "video_processing_seconds": round(processed_at - saved_at, 3),
