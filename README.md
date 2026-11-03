@@ -30,6 +30,8 @@ Running MediaPipe on the server was the bottleneck in production: a free/starter
 - Landing page with SignEase sections for impact, technology, FAQ, team, and contact.
 - Warmed `/sign-detection` route so the prediction page starts compiling/loading in the background from the home page.
 - Webcam-based sign recording with configurable capture duration.
+- Practice challenge: copy a demo clip, get instant feedback ("Nailed it", "So close") and build a streak; the best streak is remembered.
+- 3-second countdown before recording (with sound cues), Space bar to start/stop, and a session history that can be spoken back as a sentence.
 - Flask backend that extracts MediaPipe landmarks, runs a TensorFlow Lite ASL model, returns prediction confidence, and generates audio.
 - Dictionary and sign demo assets for learning supported signs.
 
@@ -69,6 +71,24 @@ Optional backend environment variables:
 | `INFERENCE_PASSES` | `1` | Model runs averaged for the chosen segment (only useful for models exported before the fine-tuned one, which dropped frames at random) |
 | `FRAME_SAMPLE_RATE` / `MAX_SAMPLED_FRAMES` | `2` / `48` | Video fallback: frame stride and cap |
 | `MAX_UPLOAD_MB` | `8` | Request size limit |
+| `INFERENCE_WORKERS` | `2` | Model copies that predict in parallel (~45 MB each) |
+| `MAX_QUEUED_PREDICTIONS` | `8` | Landmark requests allowed to wait for a free model before the server answers 503 |
+| `PREDICTION_QUEUE_TIMEOUT_SECONDS` | `15` | Longest wait for a free model |
+| `MAX_QUEUED_VIDEO_PREDICTIONS` | `2` | Video-fallback requests allowed to wait (one runs at a time) |
+| `RATE_LIMIT_PER_MINUTE` / `RATE_LIMIT_BURST` | `40` / `10` | Per-visitor prediction limit (`0` disables it) |
+| `TRUSTED_PROXY_HOPS` | `1` | Proxies in front of the app (Render's load balancer), used to find the visitor's address |
+| `GUNICORN_THREADS` | `8` | Request threads per worker |
+
+## Handling many visitors
+
+The backend is built to stay responsive when many people try the demo at once:
+
+- **Parallel predictions.** `INFERENCE_WORKERS` copies of the model take requests at the same time. With two copies, a load test of 20 concurrent visitors ran at twice the throughput of one copy (33 vs 17 predictions/s on a multi-core machine) with half the latency. On a shared Render CPU the absolute numbers are lower.
+- **Small uploads.** The browser uploads only the 94 landmark rows the model reads (`X-Landmark-Layout: compact-v1`), about 6x less data than full frames, with identical predictions. The server still accepts full frames from older clients.
+- **Backpressure instead of timeouts.** When every model copy is busy and the queue is full, the server answers `503` with `Retry-After` straight away instead of holding the connection. The video fallback (MediaPipe on the server, seconds per clip) has its own small queue, so it cannot use up the threads the fast landmark path needs.
+- **Automatic retries.** The page retries `429`/`502`/`503`/`504` responses and network failures up to 4 times, with jittered backoff and `Retry-After` honoured, and tells the user it is retrying.
+- **Per-visitor rate limit.** A token bucket per client address stops one script from starving everyone else.
+- **Horizontal scaling.** The API keeps no state between requests, so you can add instances (Render: *Scaling → Instances* on a paid plan) and Render's load balancer will spread traffic across them. `GET /health` reports model status, free capacity and request counters for monitoring, and `render.yaml` sets it as the health check so unhealthy instances are taken out of rotation.
 
 ## Keeping the backend awake
 

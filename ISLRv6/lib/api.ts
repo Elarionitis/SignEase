@@ -74,51 +74,106 @@ export function warmBackend(timeoutMs = 90_000) {
   return warmupPromise;
 }
 
+// Busy (503) and rate-limited (429) answers carry Retry-After; a network
+// failure is usually a cold start or a dropped connection. All are retried
+// a few times with backoff before the user sees an error.
+const MAX_PREDICTION_ATTEMPTS = 4;
+const MAX_RETRY_DELAY_MS = 8_000;
+
+function retryDelayMs(attempt: number, retryAfter: string | null) {
+  const seconds = Number(retryAfter);
+  const base = Number.isFinite(seconds) && seconds > 0 ? seconds * 1000 : 1000 * 2 ** attempt;
+  // Jitter spreads retries from many visitors so they don't arrive together.
+  return Math.min(MAX_RETRY_DELAY_MS, base) * (0.8 + Math.random() * 0.4);
+}
+
+function wait(ms: number, signal: AbortSignal) {
+  return new Promise<void>((resolve, reject) => {
+    if (signal.aborted) {
+      reject(new DOMException("Aborted", "AbortError"));
+      return;
+    }
+    const timeoutId = window.setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      window.clearTimeout(timeoutId);
+      reject(new DOMException("Aborted", "AbortError"));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
 export async function requestPrediction(
   path: "/predict-landmarks" | "/predict",
   body: BodyInit,
-  { signal, headers }: { signal: AbortSignal; headers?: HeadersInit }
+  {
+    signal,
+    headers,
+    onRetry,
+  }: { signal: AbortSignal; headers?: HeadersInit; onRetry?: (message: string) => void }
 ): Promise<PredictionResponse> {
-  let response: Response;
-  try {
-    response = await fetch(`${API_BASE_URL}${path}`, {
-      method: "POST",
-      body,
-      signal,
-      headers: { Accept: "application/json", ...headers },
-    });
-  } catch (error) {
-    if (error instanceof DOMException && error.name === "AbortError") throw error;
-    throw new PredictionError(
-      "Could not reach the prediction server. Check your connection and try again."
-    );
+  for (let attempt = 0; ; attempt += 1) {
+    const lastAttempt = attempt >= MAX_PREDICTION_ATTEMPTS - 1;
+    let response: Response;
+    try {
+      response = await fetch(`${API_BASE_URL}${path}`, {
+        method: "POST",
+        body,
+        signal,
+        headers: { Accept: "application/json", ...headers },
+      });
+    } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") throw error;
+      if (!lastAttempt) {
+        onRetry?.("Connection hiccup, retrying…");
+        await wait(retryDelayMs(attempt, null), signal);
+        continue;
+      }
+      throw new PredictionError(
+        "Could not reach the prediction server. Check your connection and try again."
+      );
+    }
+
+    let data: PredictionResponse | null = null;
+    try {
+      data = (await response.json()) as PredictionResponse;
+    } catch {
+      // Handled below: proxies and cold-starting hosts can return HTML errors.
+    }
+
+    const retryable = response.status === 429 || response.status === 502 ||
+      response.status === 503 || response.status === 504;
+    if (retryable && !lastAttempt) {
+      onRetry?.(
+        response.status === 429
+          ? "Lots of signs in a short time, retrying in a moment…"
+          : "The server is busy with other visitors, retrying…"
+      );
+      await wait(retryDelayMs(attempt, response.headers.get("Retry-After")), signal);
+      continue;
+    }
+
+    if (!response.ok) {
+      throw new PredictionError(
+        data?.error ||
+          (response.status === 413
+            ? "The recording is too large. Try a shorter recording."
+            : response.status >= 500
+              ? "The prediction server is starting up or busy. Please try again in a moment."
+              : `Prediction failed (${response.status})`),
+        response.status
+      );
+    }
+
+    // Any answer, even an error, means the server is awake.
+    setBackendStatus("ready");
+
+    if (!data || typeof data.sign !== "string") {
+      throw new PredictionError("The server returned an invalid response. Please try again.");
+    }
+
+    return data;
   }
-
-  let data: PredictionResponse | null = null;
-  try {
-    data = (await response.json()) as PredictionResponse;
-  } catch {
-    // Handled below: proxies and cold-starting hosts can return HTML errors.
-  }
-
-  if (!response.ok) {
-    throw new PredictionError(
-      data?.error ||
-        (response.status === 413
-          ? "The recording is too large. Try a shorter recording."
-          : response.status >= 500
-            ? "The prediction server is starting up or busy. Please try again in a moment."
-            : `Prediction failed (${response.status})`),
-      response.status
-    );
-  }
-
-  // Any answer, even an error, means the server is awake.
-  setBackendStatus("ready");
-
-  if (!data || typeof data.sign !== "string") {
-    throw new PredictionError("The server returned an invalid response. Please try again.");
-  }
-
-  return data;
 }
