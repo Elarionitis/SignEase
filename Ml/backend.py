@@ -751,7 +751,7 @@ def get_prediction(frames):
     scores = calibrate(scores)
     top_indices = np.argsort(scores)[::-1][:TOP_K]
     return [
-        {"sign": ORD2SIGN[int(index)], "confidence": round(float(scores[index]), 4)}
+        {"sign": ORD2SIGN[int(index)], "index": int(index), "confidence": round(float(scores[index]), 4)}
         for index in top_indices
     ], frames_used
 
