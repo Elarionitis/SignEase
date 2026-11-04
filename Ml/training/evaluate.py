@@ -31,10 +31,13 @@ from landmarks import expand_cached  # noqa: E402
 
 
 def use_model(path, passes):
-    import tensorflow as tf
-
-    interpreter = tf.lite.Interpreter(model_path=path)
-    backend.prediction_fn = interpreter.get_signature_runner("serving_default")
+    # The backend borrows interpreters from a pool; give it exactly one.
+    backend.TFLITE_MODEL_PATH = path
+    runner = backend.create_runner(backend.import_interpreter())
+    while not backend.interpreter_pool.empty():
+        backend.interpreter_pool.get_nowait()
+    backend.interpreter_pool.put(runner)
+    backend.prediction_fn = runner
     backend.ORD2SIGN = backend.load_labels()
     backend.INFERENCE_PASSES = passes
 

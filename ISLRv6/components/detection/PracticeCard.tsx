@@ -1,5 +1,7 @@
 import { motion, AnimatePresence } from "framer-motion";
-import { FaFire, FaRandom, FaTrophy } from "react-icons/fa";
+import { useEffect, useRef, useState } from "react";
+import { FaExpand, FaFire, FaRandom, FaRedo, FaTrophy } from "react-icons/fa";
+import { Dialog, DialogContent, DialogDescription, DialogTitle } from "@/components/ui/dialog";
 import { cn } from "@/lib/utils";
 
 export interface PracticeSign {
@@ -35,10 +37,17 @@ export function PracticeCard({
   disabled,
   onNext,
 }: PracticeCardProps) {
+  const [expanded, setExpanded] = useState(false);
+
   return (
     <div className="mb-6 rounded-xl border border-indigo-400/20 bg-gradient-to-br from-indigo-500/[0.08] to-rose-500/[0.06] p-4">
       <div className="flex items-start gap-4">
-        <div className="relative h-24 w-32 shrink-0 overflow-hidden rounded-lg border border-white/10 bg-black/40">
+        <button
+          type="button"
+          onClick={() => setExpanded(true)}
+          aria-label={`Watch the ${formatSign(target.name)} demo larger`}
+          className="group relative h-24 w-32 shrink-0 overflow-hidden rounded-lg border border-white/10 bg-black/40 focus:outline-none focus-visible:ring-2 focus-visible:ring-indigo-400"
+        >
           <video
             key={target.index}
             src={`/videos/signs/${target.index}.mp4`}
@@ -53,7 +62,12 @@ export function PracticeCard({
           <span className="absolute bottom-1 left-1 rounded bg-black/60 px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-white/70">
             Demo
           </span>
-        </div>
+          <span className="absolute inset-0 flex items-center justify-center bg-black/0 transition-colors group-hover:bg-black/40">
+            <span className="flex items-center gap-1 rounded-full bg-black/70 px-2 py-1 text-[11px] text-white opacity-90 transition-opacity sm:opacity-0 sm:group-hover:opacity-100">
+              <FaExpand className="text-[9px]" /> Enlarge
+            </span>
+          </span>
+        </button>
 
         <div className="min-w-0 flex-1">
           <p className="text-xs uppercase tracking-wider text-indigo-200/70">Your challenge</p>
@@ -69,7 +83,7 @@ export function PracticeCard({
               {formatSign(target.name)}
             </motion.p>
           </AnimatePresence>
-          <p className="mt-1 text-xs text-white/50">Watch the demo, then record yourself signing it.</p>
+          <p className="mt-1 text-xs text-white/50">Tap the demo to watch it larger, then record yourself.</p>
           <button
             type="button"
             onClick={onNext}
@@ -80,6 +94,8 @@ export function PracticeCard({
           </button>
         </div>
       </div>
+
+      <DemoDialog target={target} open={expanded} onOpenChange={setExpanded} />
 
       <div className="mt-4 grid grid-cols-3 gap-2 text-center">
         <Stat
@@ -92,6 +108,96 @@ export function PracticeCard({
         <Stat label="Matched" value={`${matched}/${attempts}`} />
       </div>
     </div>
+  );
+}
+
+const SPEEDS = [0.5, 0.75, 1] as const;
+
+/** The demo clip, large, with slow motion so the hand shape is easy to follow. */
+function DemoDialog({
+  target,
+  open,
+  onOpenChange,
+}: {
+  target: PracticeSign;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+}) {
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const [speed, setSpeed] = useState<number>(0.75);
+
+  useEffect(() => {
+    if (videoRef.current) videoRef.current.playbackRate = speed;
+  }, [speed, open]);
+
+  const replay = () => {
+    const video = videoRef.current;
+    if (!video) return;
+    video.currentTime = 0;
+    void video.play();
+  };
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="max-w-3xl border-white/10 bg-[#0b0b10] p-4 text-white sm:p-6">
+        <DialogTitle className="text-2xl">
+          How to sign “<span className="capitalize">{formatSign(target.name)}</span>”
+        </DialogTitle>
+        <DialogDescription className="text-white/60">
+          Watch the hand shape, where the hands are, and how they move. Slow it down if it is too fast.
+        </DialogDescription>
+        <div className="overflow-hidden rounded-xl border border-white/10 bg-black">
+          <video
+            ref={videoRef}
+            key={target.index}
+            src={`/videos/signs/${target.index}.mp4`}
+            className="max-h-[65vh] w-full object-contain"
+            autoPlay
+            loop
+            muted
+            playsInline
+            controls
+            onLoadedMetadata={(event) => {
+              event.currentTarget.playbackRate = speed;
+            }}
+          />
+        </div>
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="flex items-center gap-2 text-sm text-white/60">
+            Speed
+            {SPEEDS.map((value) => (
+              <button
+                key={value}
+                type="button"
+                onClick={() => setSpeed(value)}
+                className={cn(
+                  "rounded-full px-3 py-1 text-xs transition-colors",
+                  speed === value ? "bg-indigo-500 text-white" : "bg-white/5 text-white/70 hover:bg-white/10"
+                )}
+              >
+                {value === 1 ? "Normal" : `${value}x`}
+              </button>
+            ))}
+          </div>
+          <div className="flex gap-2">
+            <button
+              type="button"
+              onClick={replay}
+              className="inline-flex items-center gap-1.5 rounded-full bg-white/5 px-3 py-1.5 text-sm text-white/80 hover:bg-white/10"
+            >
+              <FaRedo className="text-xs" /> Replay
+            </button>
+            <button
+              type="button"
+              onClick={() => onOpenChange(false)}
+              className="rounded-full bg-gradient-to-r from-indigo-500 to-rose-500 px-4 py-1.5 text-sm font-medium text-white hover:opacity-90"
+            >
+              Got it, let me try
+            </button>
+          </div>
+        </div>
+      </DialogContent>
+    </Dialog>
   );
 }
 
