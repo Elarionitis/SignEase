@@ -7,9 +7,10 @@ SignEase is a sign language recognition project with a Next.js frontend and a Py
 1. While the user signs, the browser runs **MediaPipe Holistic on every camera frame** (WebAssembly + WebGL, self-hosted from `ISLRv6/public/mediapipe/`). Each frame becomes the 543 face/hand/pose landmarks the model was trained on.
 2. The frames and their timestamps are uploaded as a small binary tensor to `POST /predict-landmarks`. The backend resamples them to the 30 fps the model was trained on, finds the part of the recording where the sign happens (leaving out raising, holding and lowering the hands), and runs the TensorFlow Lite classifier.
 
-Two corrections make webcam recordings match the training data:
+Three corrections make webcam recordings match the training data:
 
 - **Frame shape.** The training videos are portrait phone recordings (about 3:4), and MediaPipe coordinates are fractions of the frame's width and height. The browser sends the camera's aspect ratio and the backend re-expresses the landmarks as a 3:4 frame. Without this, a 4:3 webcam squeezes every hand shape to about half its width.
+- **Choosing the signing hand.** The model reads only one hand, the one tracked in more frames. In two-handed signs that is often the still "base" hand, so when both hands are tracked the backend also scores each hand on its own and keeps the most confident result. On the original 120 dictionary videos this fixed 6 predictions and broke none (two-handed signs 33% → 48% correct, all signs 57% → 62%), and the same held on the 127 videos added later, which it was not tuned on (46% → 50%, 6 fixed, none broken).
 - **Calibrated confidence.** The model was trained with smoothed labels, so its raw scores rarely pass about 75% even when it is right. The backend applies temperature scaling (fitted on the 120 dictionary videos) so the confidence shown matches how often predictions are actually correct.
 3. If the device cannot run hand tracking fast enough (no WebGL2, very slow GPU), the page falls back to uploading the recorded clip to `POST /predict`, and the server extracts landmarks itself. This is slower on a shared CPU.
 
@@ -30,7 +31,9 @@ Running MediaPipe on the server was the bottleneck in production: a free/starter
 - Landing page with SignEase sections for impact, technology, FAQ, team, and contact.
 - Warmed `/sign-detection` route so the prediction page starts compiling/loading in the background from the home page.
 - Webcam-based sign recording with configurable capture duration.
-- Practice challenge: copy a demo clip, get instant feedback ("Nailed it", "So close") and build a streak; the best streak is remembered.
+- Live framing guide before recording ("Move back so your chest and stomach are in view"), since many signs are made low and are missed when the camera only sees the face and shoulders.
+- Recording stops by itself when the hands are lowered after the sign (the slider sets the maximum).
+- Practice challenge: tap the demo to watch it large and in slow motion, then copy it, get instant feedback ("Nailed it", "So close") and build a streak; the best streak is remembered.
 - 3-second countdown before recording (with sound cues), Space bar to start/stop, and a session history that can be spoken back as a sentence.
 - Flask backend that extracts MediaPipe landmarks, runs a TensorFlow Lite ASL model, returns prediction confidence, and generates audio.
 - Dictionary and sign demo assets for learning supported signs.

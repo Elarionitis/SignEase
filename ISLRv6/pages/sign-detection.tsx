@@ -51,7 +51,16 @@ const inter = { variable: "font-sans" };
 // On-device predictions only upload landmarks and return in well under a
 // second; this budget is for a Render cold start or the video fallback.
 const PREDICTION_TIMEOUT_MS = 90_000;
-const DEFAULT_RECORDING_DURATION = 3;
+// With on-device tracking the recording also stops by itself once the hands
+// are lowered, so this is only the maximum.
+const DEFAULT_RECORDING_DURATION = 5;
+// Auto-stop: hands out of view this long, after at least this many frames
+// of signing, ends the recording.
+const AUTO_STOP_HANDS_GONE_MS = 700;
+const AUTO_STOP_MIN_HAND_FRAMES = 12;
+// Live hand preview and framing check between recordings.
+const PREVIEW_INTERVAL_MS = 180;
+const COUNTDOWN_PREVIEW_INTERVAL_MS = 60;
 const MIN_RECORDING_DURATION = 1;
 const MAX_RECORDING_DURATION = 10;
 // Matches MAX_LANDMARK_FRAMES on the backend (30 fps for 10 seconds, doubled).
@@ -177,8 +186,56 @@ interface RecognitionResult {
   mode: PredictionMode;
 }
 
+type FramingIssue = "no-person" | "too-close" | "too-low" | "too-far" | "off-center" | null;
+
+const FRAMING_ADVICE: Record<Exclude<FramingIssue, null>, string> = {
+  "no-person": "Step into the camera view",
+  "too-close": "Move back so your chest and stomach are in view",
+  "too-low": "Raise the camera or sit up: your shoulders are low in the frame",
+  "too-far": "Move a little closer",
+  "off-center": "Move to the center of the frame",
+};
+
+// Pose rows in the 543-landmark frame (face 468 + left hand 21, then pose).
+const POSE_ROW = 489;
+
+/**
+ * Compares the signer's position with the training videos: shoulders about
+ * 60% down a portrait frame, ~0.4 frame heights wide, the stomach in view.
+ * Many signs are made at the chest or stomach; if that area is outside the
+ * frame the hands are not tracked and the model sees a different sign.
+ */
+function analyzeFraming(values: Float32Array, aspect: number): FramingIssue {
+  const point = (index: number) => ({
+    x: values[(POSE_ROW + index) * 3],
+    y: values[(POSE_ROW + index) * 3 + 1],
+  });
+  const left = point(11);
+  const right = point(12);
+  const hips = [point(23), point(24)];
+  if (![left.x, left.y, right.x, right.y].every(Number.isFinite)) return "no-person";
+
+  const shoulderY = (left.y + right.y) / 2;
+  const centerX = (left.x + right.x) / 2;
+  // In frame heights, so landscape and portrait cameras compare equally.
+  const shoulderWidth = Math.abs(left.x - right.x) * aspect;
+  const hipY = hips.every((hip) => Number.isFinite(hip.y)) ? (hips[0].y + hips[1].y) / 2 : Infinity;
+
+  if (shoulderWidth > 0.6 || hipY > 1.35) return "too-close";
+  if (shoulderY > 0.75) return "too-low";
+  if (shoulderWidth < 0.16) return "too-far";
+  if (Math.abs(centerX - 0.5) > 0.22) return "off-center";
+  return null;
+}
+
+function sleep(ms: number) {
+  return new Promise<void>((resolve) => window.setTimeout(resolve, ms));
+}
+
 interface RecordingSession {
   active: boolean;
+  lastHandAt: number;
+  autoStopped: boolean;
   startedAt: number;
   handFrames: Float32Array[];
   handFrameTimes: number[];
@@ -200,6 +257,17 @@ function getSupportedRecordingMimeType() {
 
 function getRecordingExtension(mimeType: string) {
   return mimeType.includes("mp4") ? "mp4" : "webm";
+}
+
+// Display names for the model's classes (the frontend map can rename a sign,
+// e.g. "weus" -> "we/us"); the server answers with its own names and the index.
+const INDEX_TO_SIGN = new Map(
+  Object.entries(signMap as Record<string, number>).map(([name, index]) => [index, name])
+);
+
+function displayPrediction(prediction: SignPrediction): SignPrediction {
+  const name = prediction.index !== undefined ? INDEX_TO_SIGN.get(prediction.index) : undefined;
+  return name ? { ...prediction, sign: name } : prediction;
 }
 
 function formatSign(sign: string) {
@@ -412,6 +480,10 @@ const SignDetection: React.FC<SignDetectionProps> = ({ practiceSigns }) => {
   const [countdown, setCountdown] = useState<number | null>(null);
   const [useCountdown, setUseCountdown] = useState<boolean>(true);
   const [retryNotice, setRetryNotice] = useState<string>("");
+  const [framing, setFraming] = useState<FramingIssue | "unknown">("unknown");
+  const [signingStarted, setSigningStarted] = useState<boolean>(false);
+  const previewLoopRef = useRef<Promise<void> | null>(null);
+  const finishRecordingRef = useRef<() => Promise<void>>(async () => undefined);
   const countdownTimerRef = useRef<number | null>(null);
 
   // Practice challenge and session history
@@ -667,6 +739,8 @@ const SignDetection: React.FC<SignDetectionProps> = ({ practiceSigns }) => {
       const tracker = trackerRef.current;
       if (!tracker) return;
 
+      // Let the between-recordings preview finish its last frame first.
+      await previewLoopRef.current;
       tracker.reset();
       let slowFrames = 0;
       while (session.active) {
@@ -695,6 +769,19 @@ const SignDetection: React.FC<SignDetectionProps> = ({ practiceSigns }) => {
         if (!frame || !session.active) continue;
 
         session.trackedFrames += 1;
+        if (frame.hasHands) {
+          if (session.handFrames.length === 0 && mountedRef.current) setSigningStarted(true);
+          session.lastHandAt = startedAt;
+        } else if (
+          session.handFrames.length >= AUTO_STOP_MIN_HAND_FRAMES &&
+          startedAt - session.lastHandAt > AUTO_STOP_HANDS_GONE_MS
+        ) {
+          // The hands were lowered after signing: stop instead of making
+          // the user wait for the timer (the idle tail only adds noise).
+          session.autoStopped = true;
+          void finishRecordingRef.current();
+          break;
+        }
         // Timestamps must strictly increase for the server's resampling.
         const lastTime = session.handFrameTimes[session.handFrameTimes.length - 1] ?? -Infinity;
         if (
@@ -811,9 +898,9 @@ const SignDetection: React.FC<SignDetectionProps> = ({ practiceSigns }) => {
       }
       if (!mountedRef.current) return;
 
-      const alternatives = (response.predictions || []).filter(
-        (prediction) => prediction.sign !== response.sign
-      );
+      const ranked = (response.predictions || []).map(displayPrediction);
+      if (ranked[0]) response = { ...response, sign: ranked[0].sign };
+      const alternatives = ranked.filter((prediction) => prediction.sign !== response.sign);
       setResult({ sign: response.sign, confidence: response.confidence, alternatives, mode });
       setErrorMessage("");
       setPhase("result");
@@ -898,8 +985,11 @@ const SignDetection: React.FC<SignDetectionProps> = ({ practiceSigns }) => {
       setIsSpeaking(false);
 
       const { recorder, stopped } = startRecorder(stream);
+      setSigningStarted(false);
       const session: RecordingSession = {
         active: true,
+        lastHandAt: 0,
+        autoStopped: false,
         startedAt: performance.now(),
         handFrames: [],
         handFrameTimes: [],
@@ -932,6 +1022,7 @@ const SignDetection: React.FC<SignDetectionProps> = ({ practiceSigns }) => {
     },
     [duration, finishRecording, runTrackingLoop, showError, trackerRef, trackerStatus]
   );
+  finishRecordingRef.current = finishRecording;
   const beginRecordingRef = useRef(beginRecording);
   beginRecordingRef.current = beginRecording;
 
@@ -1005,11 +1096,49 @@ const SignDetection: React.FC<SignDetectionProps> = ({ practiceSigns }) => {
     if (history.length) speak(history.map((entry) => formatSign(entry.sign)).join(" "));
   };
 
+  // Between recordings, track at a low rate to show the hands live and check
+  // the framing; faster during the countdown, when the user is getting ready.
+  useEffect(() => {
+    if (trackerStatus !== "ready" || !cameraReady) return;
+    if (phase === "recording" || phase === "processing") return;
+    const video = webcamRef.current?.video;
+    const tracker = trackerRef.current;
+    if (!video || !tracker) return;
+
+    let stopped = false;
+    const intervalMs = phase === "countdown" ? COUNTDOWN_PREVIEW_INTERVAL_MS : PREVIEW_INTERVAL_MS;
+    const loop = async () => {
+      while (!stopped) {
+        if (document.visibilityState === "visible" && video.readyState >= 2 && video.videoHeight) {
+          let frame: LandmarkFrame | null = null;
+          try {
+            frame = await tracker.process(video);
+          } catch {
+            return;
+          }
+          if (stopped) return;
+          if (frame) {
+            setFraming(analyzeFraming(frame.values, video.videoWidth / video.videoHeight));
+            setHandsVisible(frame.hasHands);
+            drawHands(overlayRef.current, video, [frame.leftHand, frame.rightHand]);
+          }
+        }
+        await sleep(intervalMs);
+      }
+    };
+    previewLoopRef.current = loop();
+
+    return () => {
+      stopped = true;
+    };
+  }, [cameraReady, phase, trackerRef, trackerStatus]);
+
   // Space starts a recording (or stops / cancels one) from anywhere on the
   // page, including while a button has focus after being clicked.
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.code !== "Space" || isTypingTarget(event.target)) return;
+      if (document.querySelector('[role="dialog"]')) return;
       event.preventDefault();
       if (event.repeat) return;
       if (phase === "countdown") cancelCountdown();
@@ -1019,7 +1148,9 @@ const SignDetection: React.FC<SignDetectionProps> = ({ practiceSigns }) => {
     // A focused button "clicks" on Space keyup; cancel that so the key does
     // not also press whatever button was clicked last.
     const onKeyUp = (event: KeyboardEvent) => {
-      if (event.code === "Space" && !isTypingTarget(event.target)) event.preventDefault();
+      if (event.code === "Space" && !isTypingTarget(event.target) && !document.querySelector('[role="dialog"]')) {
+        event.preventDefault();
+      }
     };
     window.addEventListener("keydown", onKeyDown);
     window.addEventListener("keyup", onKeyUp);
@@ -1441,7 +1572,7 @@ const SignDetection: React.FC<SignDetectionProps> = ({ practiceSigns }) => {
                           aria-hidden="true"
                           className={cn(
                             "absolute inset-0 w-full h-full object-cover pointer-events-none transition-opacity",
-                            isRecording ? "opacity-100" : "opacity-0"
+                            trackerStatus === "ready" && phase !== "processing" ? "opacity-100" : "opacity-0"
                           )}
                           style={{ transform: "scaleX(-1)" }}
                         />
@@ -1486,6 +1617,35 @@ const SignDetection: React.FC<SignDetectionProps> = ({ practiceSigns }) => {
                                 ? `Get ready to sign “${formatSign(practiceTarget.name)}”`
                                 : "Get your hands ready"}
                             </p>
+                            {framing !== "unknown" && framing !== null && (
+                              <p className="mt-2 rounded-full bg-amber-500/25 px-3 py-1 text-xs text-amber-100">
+                                {FRAMING_ADVICE[framing]}
+                              </p>
+                            )}
+                          </div>
+                        )}
+
+                        {/* Framing guide between recordings */}
+                        {cameraReady && trackerStatus === "ready" && !isRecording && !isCountingDown &&
+                          phase !== "processing" && framing !== "unknown" && (
+                          <div
+                            className={cn(
+                              "absolute bottom-3 left-1/2 flex max-w-[90%] -translate-x-1/2 items-center gap-2 rounded-full border px-3 py-1.5 text-xs font-medium backdrop-blur-md",
+                              framing === null
+                                ? "border-emerald-400/30 bg-emerald-500/20 text-emerald-100"
+                                : "border-amber-400/30 bg-amber-500/25 text-amber-100"
+                            )}
+                          >
+                            {framing === null ? (
+                              <>
+                                <FaCheckCircle className="shrink-0" /> Good framing
+                                {handsVisible ? ", hands tracked" : ""}
+                              </>
+                            ) : (
+                              <>
+                                <FaExclamationTriangle className="shrink-0" /> {FRAMING_ADVICE[framing]}
+                              </>
+                            )}
                           </div>
                         )}
 
@@ -1520,6 +1680,15 @@ const SignDetection: React.FC<SignDetectionProps> = ({ practiceSigns }) => {
                                 {handsVisible ? "Hands tracked" : "Show your hands"}
                               </div>
                             )}
+                            <div className="absolute bottom-9 left-0 right-0 mx-auto flex justify-center px-4">
+                              <span className="rounded-full bg-black/60 px-4 py-1.5 text-sm font-medium text-white backdrop-blur-md">
+                                {trackerStatus !== "ready"
+                                  ? "Sign now"
+                                  : !signingStarted
+                                    ? "Sign now ✋"
+                                    : "Lower your hands when you're done"}
+                              </span>
+                            </div>
                             <div className="absolute bottom-4 left-0 right-0 mx-auto w-3/4 h-1.5 bg-black/40 rounded-full overflow-hidden">
                               <div
                                 className="h-full bg-gradient-to-r from-indigo-500 to-rose-500 rounded-full transition-[width] duration-100 ease-linear"
@@ -1645,7 +1814,7 @@ const SignDetection: React.FC<SignDetectionProps> = ({ practiceSigns }) => {
                       <div className="mt-8">
                         <div className="flex items-center justify-between mb-3">
                           <label id="recording-duration-label" className="text-white/70 text-sm font-medium">
-                            Recording Duration
+                            {trackerStatus === "ready" ? "Maximum recording time" : "Recording Duration"}
                           </label>
                           <span className="text-white/90 font-medium px-3 py-1 bg-white/5 rounded-full tabular-nums">
                             {duration} {duration === 1 ? "second" : "seconds"}
@@ -1661,6 +1830,11 @@ const SignDetection: React.FC<SignDetectionProps> = ({ practiceSigns }) => {
                           aria-labelledby="recording-duration-label"
                           className="relative z-10"
                         />
+                        {trackerStatus === "ready" && (
+                          <p className="mt-2 text-xs text-white/40">
+                            Recording stops by itself when you lower your hands after the sign.
+                          </p>
+                        )}
                         <label className="mt-5 flex cursor-pointer items-center justify-between gap-3 text-sm text-white/70">
                           <span>
                             {COUNTDOWN_SECONDS}-second countdown before recording
@@ -1985,10 +2159,10 @@ const SignDetection: React.FC<SignDetectionProps> = ({ practiceSigns }) => {
 
                           <ol className="list-decimal list-inside space-y-3 text-sm text-white/60 ml-1">
                             {[
-                              "Position yourself so your face and both hands are in the camera view",
+                              "Sit back so your head, chest and stomach are in view: many signs are made low, and the green \"Good framing\" badge tells you when you're set",
                               `Use the slider to adjust the recording duration (${MIN_RECORDING_DURATION}-${MAX_RECORDING_DURATION} seconds)`,
                               'Click "Start Recording" (or press Space); a short countdown gives you time to get ready',
-                              "Perform the whole sign before the recording completes",
+                              "Do the sign, then lower your hands: the recording stops by itself",
                               "Your sign language translation appears right after recording",
                               'Not sure what to sign? Switch to "Practice challenge", copy the demo and build a streak',
                             ].map((step, index) => (
