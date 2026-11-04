@@ -1,0 +1,25 @@
+# Render Blueprint for the prediction API (optional: services created in the
+# dashboard keep working). Apply it from Render -> Blueprints -> New Blueprint.
+services:
+  - type: web
+    name: signease-backend
+    runtime: python
+    rootDir: Ml
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn -c gunicorn.conf.py backend:app
+    # Render routes traffic only to instances that pass this check, so a
+    # restarting or overloaded instance is taken out of the load balancer.
+    healthCheckPath: /health
+    # On a paid plan, raise this (or enable autoscaling) to spread visitors
+    # across several instances; the API keeps no state between requests.
+    numInstances: 1
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.11
+      - key: CORS_ORIGINS
+        sync: false
+      - key: INFERENCE_WORKERS
+        value: "2"
+      - key: GUNICORN_THREADS
+        value: "8"
