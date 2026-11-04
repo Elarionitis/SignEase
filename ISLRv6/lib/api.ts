@@ -5,6 +5,8 @@ export const API_BASE_URL =
 export interface SignPrediction {
   sign: string;
   confidence: number;
+  /** Model class index; display names come from the frontend's sign map. */
+  index?: number;
 }
 
 export interface PredictionResponse extends SignPrediction {

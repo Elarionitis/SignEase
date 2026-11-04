@@ -259,6 +259,17 @@ function getRecordingExtension(mimeType: string) {
   return mimeType.includes("mp4") ? "mp4" : "webm";
 }
 
+// Display names for the model's classes (the frontend map can rename a sign,
+// e.g. "weus" -> "we/us"); the server answers with its own names and the index.
+const INDEX_TO_SIGN = new Map(
+  Object.entries(signMap as Record<string, number>).map(([name, index]) => [index, name])
+);
+
+function displayPrediction(prediction: SignPrediction): SignPrediction {
+  const name = prediction.index !== undefined ? INDEX_TO_SIGN.get(prediction.index) : undefined;
+  return name ? { ...prediction, sign: name } : prediction;
+}
+
 function formatSign(sign: string) {
   return sign.replace(/_/g, " ");
 }
@@ -887,9 +898,9 @@ const SignDetection: React.FC<SignDetectionProps> = ({ practiceSigns }) => {
       }
       if (!mountedRef.current) return;
 
-      const alternatives = (response.predictions || []).filter(
-        (prediction) => prediction.sign !== response.sign
-      );
+      const ranked = (response.predictions || []).map(displayPrediction);
+      if (ranked[0]) response = { ...response, sign: ranked[0].sign };
+      const alternatives = ranked.filter((prediction) => prediction.sign !== response.sign);
       setResult({ sign: response.sign, confidence: response.confidence, alternatives, mode });
       setErrorMessage("");
       setPhase("result");
