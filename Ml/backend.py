@@ -15,9 +15,11 @@ Two prediction paths share one TensorFlow Lite model:
 import json
 import logging
 import os
+import queue
 import threading
 import time
 import warnings
+from contextlib import contextmanager
 from pathlib import Path
 from uuid import uuid4
 
@@ -36,6 +38,7 @@ import numpy as np
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from werkzeug.exceptions import HTTPException
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 
 def env_int(name, default, minimum=1):
@@ -54,6 +57,10 @@ def env_float(name, default, minimum, maximum):
 
 
 app = Flask(__name__)
+# Render (and most hosts) terminate TLS at a load balancer and pass the
+# client address in X-Forwarded-For; trust exactly one proxy hop so the
+# per-client rate limit sees real visitors instead of the balancer.
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=env_int("TRUSTED_PROXY_HOPS", 1, minimum=0))
 app.config["MAX_CONTENT_LENGTH"] = env_int("MAX_UPLOAD_MB", 8) * 1024 * 1024
 
 cors_origins = [
@@ -61,7 +68,12 @@ cors_origins = [
     for origin in os.environ.get("CORS_ORIGINS", "*").split(",")
     if origin.strip()
 ]
-CORS(app, resources={r"/*": {"origins": cors_origins or "*"}}, max_age=86400)
+CORS(
+    app,
+    resources={r"/*": {"origins": cors_origins or "*"}},
+    max_age=86400,
+    expose_headers=["Retry-After"],
+)
 
 # Flask defaults to warning-level logs under Gunicorn, which hides the request
 # timing needed to diagnose production prediction latency.
@@ -92,6 +104,26 @@ LEFT_HAND_ROWS = slice(468, 489)
 RIGHT_HAND_ROWS = slice(522, 543)
 LEFT_SHOULDER_ROW = 468 + 21 + 11
 RIGHT_SHOULDER_ROW = 468 + 21 + 12
+
+# The classifier only reads 40 lip points, both hands and 5 points of each
+# arm (x/y); the segment finder also uses the shoulders. Browsers can upload
+# just these rows ("X-Landmark-Layout: compact-v1"), which is about 6x
+# smaller than full frames and gives the model exactly what it was trained
+# on (training/landmarks.py CACHE_ROWS: every other row was NaN in training).
+# Keep this order in sync with COMPACT_ROWS in ISLRv6/lib/holistic.ts.
+LIP_ROWS = (
+    61, 185, 40, 39, 37, 0, 267, 269, 270, 409, 291, 146, 91, 181, 84, 17, 314, 405, 321, 375,
+    78, 191, 80, 81, 82, 13, 312, 311, 310, 415, 95, 88, 178, 87, 14, 317, 402, 318, 324, 308,
+)
+COMPACT_ROWS = np.array(
+    LIP_ROWS
+    + tuple(range(468, 489))
+    + tuple(range(522, 543))
+    + (LEFT_SHOULDER_ROW, RIGHT_SHOULDER_ROW)
+    + tuple(range(502, 512)),
+    dtype=np.intp,
+)
+COMPACT_LAYOUT = "compact-v1"
 
 # The model was trained on ~30 fps clips trimmed to the sign itself. Recordings
 # are resampled to this rate by timestamp, and the signing segment is found
@@ -134,18 +166,141 @@ FRAME_SAMPLE_RATE = env_int("FRAME_SAMPLE_RATE", 2)
 MAX_SAMPLED_FRAMES = env_int("MAX_SAMPLED_FRAMES", 48)
 MAX_VIDEO_FRAME_WIDTH = env_int("MAX_VIDEO_FRAME_WIDTH", 640)
 
-interpreter = None
+# --- Capacity -------------------------------------------------------------
+# A TFLite interpreter is not thread-safe, so each concurrent prediction
+# needs its own. Each copy costs ~45 MB; two fit Render's 512 MB instance
+# next to the video fallback and let one visitor's prediction run while
+# another's is still scoring.
+INFERENCE_WORKERS = env_int("INFERENCE_WORKERS", 2)
+# Landmark predictions take well under a second, so a short wait for a free
+# interpreter is better than an error. Beyond this queue depth, answer 503
+# with Retry-After immediately so threads stay free for health checks and the
+# browser retries with backoff instead of piling onto a busy server.
+MAX_QUEUED_PREDICTIONS = env_int("MAX_QUEUED_PREDICTIONS", 8)
+PREDICTION_QUEUE_TIMEOUT_SECONDS = env_float("PREDICTION_QUEUE_TIMEOUT_SECONDS", 15, 1, 120)
+# The video fallback runs MediaPipe on the server for seconds per clip. Allow
+# one at a time plus a small queue, so a burst of fallback users cannot tie
+# up every worker thread and stall the fast landmark path.
+MAX_QUEUED_VIDEO_PREDICTIONS = env_int("MAX_QUEUED_VIDEO_PREDICTIONS", 2)
+VIDEO_QUEUE_TIMEOUT_SECONDS = env_float("VIDEO_QUEUE_TIMEOUT_SECONDS", 30, 1, 120)
+BUSY_RETRY_AFTER_SECONDS = 2
+# Per-client limit on prediction requests (token bucket). Generous for a
+# person signing, but stops a single script from starving everyone else.
+RATE_LIMIT_PER_MINUTE = env_int("RATE_LIMIT_PER_MINUTE", 40, minimum=0)
+RATE_LIMIT_BURST = env_int("RATE_LIMIT_BURST", 10)
+
+interpreter_pool = queue.Queue()
 prediction_fn = None
 ORD2SIGN = None
 holistic = None
-inference_lock = threading.Lock()
 holistic_lock = threading.Lock()
 model_load_lock = threading.Lock()
 holistic_load_lock = threading.Lock()
 
 
+class AdmissionGate:
+    """Bounds how many requests may run or wait for a scarce resource."""
+
+    def __init__(self, limit):
+        self.limit = limit
+        self.active = 0
+        self.lock = threading.Lock()
+
+    @contextmanager
+    def admit(self):
+        """Yields True if the request may proceed, False if it should be
+        turned away; the slot is released when the block exits."""
+        with self.lock:
+            admitted = self.active < self.limit
+            if admitted:
+                self.active += 1
+        try:
+            yield admitted
+        finally:
+            if admitted:
+                with self.lock:
+                    self.active -= 1
+
+
+class RateLimiter:
+    """In-memory token bucket per client address. Per worker process, which
+    is fine for abuse protection; it is not an exact global quota."""
+
+    def __init__(self, per_minute, burst, max_clients=10_000):
+        self.rate = per_minute / 60.0
+        self.burst = float(burst)
+        self.max_clients = max_clients
+        self.buckets = {}
+        self.lock = threading.Lock()
+
+    def check(self, client):
+        """Returns 0 if allowed, else seconds until the next request is."""
+        if self.rate <= 0:
+            return 0
+        now = time.monotonic()
+        with self.lock:
+            if len(self.buckets) > self.max_clients:
+                stale = now - self.burst / self.rate
+                self.buckets = {key: value for key, value in self.buckets.items() if value[1] > stale}
+            tokens, updated = self.buckets.get(client, (self.burst, now))
+            tokens = min(self.burst, tokens + (now - updated) * self.rate)
+            if tokens < 1:
+                self.buckets[client] = (tokens, now)
+                return max(1, int(np.ceil((1 - tokens) / self.rate)))
+            self.buckets[client] = (tokens - 1, now)
+            return 0
+
+
+prediction_gate = AdmissionGate(INFERENCE_WORKERS + MAX_QUEUED_PREDICTIONS)
+video_gate = AdmissionGate(1 + MAX_QUEUED_VIDEO_PREDICTIONS)
+rate_limiter = RateLimiter(RATE_LIMIT_PER_MINUTE, RATE_LIMIT_BURST)
+stats = {"predictions": 0, "rejected_busy": 0, "rejected_rate_limit": 0}
+stats_lock = threading.Lock()
+
+
+def count(stat):
+    with stats_lock:
+        stats[stat] += 1
+
+
+def busy_response(message):
+    count("rejected_busy")
+    response = jsonify({"error": message, "retry": True})
+    response.status_code = 503
+    response.headers["Retry-After"] = str(BUSY_RETRY_AFTER_SECONDS)
+    return response
+
+
+class ServerBusy(Exception):
+    """No interpreter became free in time."""
+
+
 class PredictionInputError(ValueError):
     """Raised when an upload cannot be turned into model input."""
+
+
+@app.before_request
+def limit_prediction_rate():
+    if request.method != "POST" or request.endpoint not in {"predict", "predict_landmarks"}:
+        return None
+    retry_after = rate_limiter.check(request.remote_addr or "unknown")
+    if not retry_after:
+        return None
+    count("rejected_rate_limit")
+    response = jsonify({
+        "error": "Too many predictions in a short time. Please wait a few seconds and try again.",
+        "retry": True,
+    })
+    response.status_code = 429
+    response.headers["Retry-After"] = str(retry_after)
+    return response
+
+
+@app.after_request
+def no_store(response):
+    # Predictions and status must never be cached by a browser or CDN.
+    response.headers.setdefault("Cache-Control", "no-store")
+    return response
 
 
 @app.errorhandler(Exception)
@@ -169,7 +324,7 @@ def load_labels():
 
 def load_model():
     """Loads the classifier. Cheap (~1s), so warmup and /predict-landmarks only need this."""
-    global interpreter, prediction_fn, ORD2SIGN
+    global prediction_fn, ORD2SIGN
 
     if prediction_fn is not None:
         return
@@ -181,45 +336,66 @@ def load_model():
         if not os.path.isfile(TFLITE_MODEL_PATH):
             raise RuntimeError(f"Missing ML model: {TFLITE_MODEL_PATH}")
 
-        try:
-            from tflite_runtime.interpreter import Interpreter
-        except ImportError:
-            # tflite-runtime has no macOS wheels; full TensorFlow works for
-            # local development.
-            try:
-                import tensorflow as tf
-
-                Interpreter = tf.lite.Interpreter
-            except ImportError as error:
-                raise RuntimeError(
-                    "tflite-runtime is required for inference; install the pinned "
-                    "dependency from requirements.txt"
-                ) from error
-
+        Interpreter = import_interpreter()
         labels = load_labels()
-        model = Interpreter(
-            model_path=TFLITE_MODEL_PATH,
-            num_threads=env_int("TFLITE_NUM_THREADS", 1),
-        )
-        serving_signature = model.get_signature_list().get("serving_default")
-        if not serving_signature:
-            raise RuntimeError("TFLite model is missing the serving_default signature")
-        if "inputs" not in serving_signature.get("inputs", []):
-            raise RuntimeError("TFLite serving_default signature is missing the inputs tensor")
-        if "outputs" not in serving_signature.get("outputs", []):
-            raise RuntimeError("TFLite serving_default signature is missing the outputs tensor")
-        runner = model.get_signature_runner("serving_default")
+        runners = [create_runner(Interpreter) for _ in range(INFERENCE_WORKERS)]
+        for runner in runners:
+            interpreter_pool.put(runner)
 
-        # The first invocation allocates tensors; do it here instead of
-        # inside the user's first prediction.
-        warm_input = np.full((1, ROWS_PER_FRAME, COORDINATES), np.nan, dtype=np.float32)
-        warm_input[:, RIGHT_HAND_ROWS] = 0.5
-        with inference_lock:
-            runner(inputs=warm_input)
-
-        interpreter = model
         ORD2SIGN = labels
-        prediction_fn = runner
+        # Set last: it marks the model as ready for other threads.
+        prediction_fn = runners[0]
+        app.logger.info("Loaded the sign model (%s interpreters)", len(runners))
+
+
+def import_interpreter():
+    try:
+        from tflite_runtime.interpreter import Interpreter
+
+        return Interpreter
+    except ImportError:
+        pass
+    # tflite-runtime has no wheels for macOS or Python 3.12+; LiteRT (its
+    # successor) or full TensorFlow work for local development.
+    try:
+        from ai_edge_litert.interpreter import Interpreter
+
+        return Interpreter
+    except ImportError:
+        pass
+    try:
+        import tensorflow as tf
+
+        return tf.lite.Interpreter
+    except ImportError as error:
+        raise RuntimeError(
+            "tflite-runtime is required for inference; install the pinned "
+            "dependency from requirements.txt"
+        ) from error
+
+
+def create_runner(Interpreter):
+    model = Interpreter(
+        model_path=TFLITE_MODEL_PATH,
+        num_threads=env_int("TFLITE_NUM_THREADS", 1),
+    )
+    serving_signature = model.get_signature_list().get("serving_default")
+    if not serving_signature:
+        raise RuntimeError("TFLite model is missing the serving_default signature")
+    if "inputs" not in serving_signature.get("inputs", []):
+        raise RuntimeError("TFLite serving_default signature is missing the inputs tensor")
+    if "outputs" not in serving_signature.get("outputs", []):
+        raise RuntimeError("TFLite serving_default signature is missing the outputs tensor")
+    runner = model.get_signature_runner("serving_default")
+
+    # The first invocation allocates tensors; do it here instead of inside
+    # the user's first prediction.
+    warm_input = np.full((1, ROWS_PER_FRAME, COORDINATES), np.nan, dtype=np.float32)
+    warm_input[:, RIGHT_HAND_ROWS] = 0.5
+    runner(inputs=warm_input)
+    # Keep the interpreter alive alongside its runner.
+    runner.interpreter = model
+    return runner
 
 
 def load_holistic():
@@ -382,30 +558,35 @@ def process_video(video_path):
     timestamps = []
     aspect_ratio = DEFAULT_CAMERA_ASPECT_RATIO
     frame_index = 0
+    # Wait a bounded time for MediaPipe (one clip at a time); the route's
+    # admission gate keeps this queue short.
+    if not holistic_lock.acquire(timeout=VIDEO_QUEUE_TIMEOUT_SECONDS):
+        cap.release()
+        raise ServerBusy()
     try:
-        with holistic_lock:
-            while len(frames) < MAX_SAMPLED_FRAMES:
-                success, image = cap.read()
-                if not success:
-                    break
+        while len(frames) < MAX_SAMPLED_FRAMES:
+            success, image = cap.read()
+            if not success:
+                break
 
-                if frame_index % FRAME_SAMPLE_RATE == 0:
-                    height, width = image.shape[:2]
-                    aspect_ratio = width / height
-                    if width > MAX_VIDEO_FRAME_WIDTH:
-                        scale = MAX_VIDEO_FRAME_WIDTH / width
-                        image = cv2.resize(
-                            image,
-                            (MAX_VIDEO_FRAME_WIDTH, int(height * scale)),
-                            interpolation=cv2.INTER_AREA,
-                        )
-                    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-                    image.flags.writeable = False
-                    frames.append(landmarks_to_frame_array(holistic.process(image)))
-                    timestamps.append(frame_index * 1000.0 / fps)
+            if frame_index % FRAME_SAMPLE_RATE == 0:
+                height, width = image.shape[:2]
+                aspect_ratio = width / height
+                if width > MAX_VIDEO_FRAME_WIDTH:
+                    scale = MAX_VIDEO_FRAME_WIDTH / width
+                    image = cv2.resize(
+                        image,
+                        (MAX_VIDEO_FRAME_WIDTH, int(height * scale)),
+                        interpolation=cv2.INTER_AREA,
+                    )
+                image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                image.flags.writeable = False
+                frames.append(landmarks_to_frame_array(holistic.process(image)))
+                timestamps.append(frame_index * 1000.0 / fps)
 
-                frame_index += 1
+            frame_index += 1
     finally:
+        holistic_lock.release()
         cap.release()
 
     if not frames:
@@ -414,11 +595,19 @@ def process_video(video_path):
     return np.stack(frames, axis=0), np.asarray(timestamps), aspect_ratio
 
 
-def parse_landmark_upload(body, frame_count_header):
-    """Parses float32 frames [N, 543, 3], optionally followed by N float32
-    capture timestamps in milliseconds (sent with an X-Frame-Count header)."""
+def parse_landmark_upload(body, frame_count_header, layout_header=None):
+    """Parses float32 frames [N, 543, 3] (or [N, len(COMPACT_ROWS), 3] with
+    the compact layout), optionally followed by N float32 capture timestamps
+    in milliseconds (sent with an X-Frame-Count header)."""
     if not body:
         raise PredictionInputError("No landmark data uploaded")
+
+    layout = (layout_header or "full").strip().lower()
+    if layout not in {"full", COMPACT_LAYOUT}:
+        raise PredictionInputError(f"Unknown X-Landmark-Layout {layout_header!r}")
+    rows = len(COMPACT_ROWS) if layout == COMPACT_LAYOUT else ROWS_PER_FRAME
+    frame_values = rows * COORDINATES
+    frame_bytes = frame_values * 4
 
     timestamps = None
     if frame_count_header:
@@ -426,13 +615,13 @@ def parse_landmark_upload(body, frame_count_header):
             frame_count = int(frame_count_header)
         except ValueError:
             raise PredictionInputError("X-Frame-Count must be an integer") from None
-        if frame_count < 1 or len(body) != frame_count * (FRAME_BYTES + 4):
+        if frame_count < 1 or len(body) != frame_count * (frame_bytes + 4):
             raise PredictionInputError("Landmark payload size does not match X-Frame-Count")
-    elif len(body) % FRAME_BYTES == 0:
-        frame_count = len(body) // FRAME_BYTES
+    elif len(body) % frame_bytes == 0:
+        frame_count = len(body) // frame_bytes
     else:
         raise PredictionInputError(
-            f"Landmark payload must be float32 frames of {ROWS_PER_FRAME}x{COORDINATES} values"
+            f"Landmark payload must be float32 frames of {rows}x{COORDINATES} values"
         )
 
     if frame_count > MAX_LANDMARK_FRAMES:
@@ -441,20 +630,39 @@ def parse_landmark_upload(body, frame_count_header):
         )
 
     values = np.frombuffer(body, dtype="<f4")
-    frames = values[:frame_count * FRAME_VALUES].reshape(frame_count, ROWS_PER_FRAME, COORDINATES)
+    uploaded = values[:frame_count * frame_values].reshape(frame_count, rows, COORDINATES)
     # Infinity is never a valid landmark; treat it as "not detected" like NaN.
-    frames = np.where(np.isfinite(frames), frames, np.nan).astype(np.float32)
+    uploaded = np.where(np.isfinite(uploaded), uploaded, np.nan).astype(np.float32)
+    if layout == COMPACT_LAYOUT:
+        frames = np.full((frame_count, ROWS_PER_FRAME, COORDINATES), np.nan, dtype=np.float32)
+        frames[:, COMPACT_ROWS] = uploaded
+    else:
+        frames = uploaded
 
     if frame_count_header:
-        timestamps = values[frame_count * FRAME_VALUES:].astype(np.float64)
+        timestamps = values[frame_count * frame_values:].astype(np.float64)
         if not np.all(np.isfinite(timestamps)) or np.any(np.diff(timestamps) <= 0):
             raise PredictionInputError("Frame timestamps must be finite and increasing")
     return frames, timestamps
 
 
-def run_model(model_input):
-    with inference_lock:
-        outputs = prediction_fn(inputs=model_input)["outputs"]
+class pooled_runner:
+    """Borrows an interpreter for one prediction (all its windows), waiting
+    a bounded time for one to free up."""
+
+    def __enter__(self):
+        try:
+            self.runner = interpreter_pool.get(timeout=PREDICTION_QUEUE_TIMEOUT_SECONDS)
+        except queue.Empty:
+            raise ServerBusy() from None
+        return self.runner
+
+    def __exit__(self, *exc_info):
+        interpreter_pool.put(self.runner)
+
+
+def run_model(runner, model_input):
+    outputs = runner(inputs=model_input)["outputs"]
     return np.asarray(outputs, dtype=np.float64).reshape(-1)
 
 
@@ -494,10 +702,13 @@ def score_recording(frames):
         if len(model_input) >= MIN_WINDOW_FRAMES
     ] or [hand_frames_in(frames, (0, len(frames)))]
 
-    window_scores = [run_model(model_input) for model_input in windows]
-    sign_index = int(np.mean(window_scores, axis=0).argmax())
-    best = int(np.argmax([scores[sign_index] for scores in window_scores]))
-    outputs = [window_scores[best]] + [run_model(windows[best]) for _ in range(INFERENCE_PASSES - 1)]
+    with pooled_runner() as runner:
+        window_scores = [run_model(runner, model_input) for model_input in windows]
+        sign_index = int(np.mean(window_scores, axis=0).argmax())
+        best = int(np.argmax([scores[sign_index] for scores in window_scores]))
+        outputs = [window_scores[best]] + [
+            run_model(runner, windows[best]) for _ in range(INFERENCE_PASSES - 1)
+        ]
     return np.mean(outputs, axis=0), len(windows[best])
 
 
@@ -525,11 +736,15 @@ def prediction_response(frames, timestamps_ms, aspect_ratio, timing, started_at)
         }), 422
 
     inference_started_at = time.perf_counter()
-    predictions, frames_used = get_prediction(prepare_frames(frames, timestamps_ms, aspect_ratio))
+    try:
+        predictions, frames_used = get_prediction(prepare_frames(frames, timestamps_ms, aspect_ratio))
+    except ServerBusy:
+        return busy_response("The prediction server is busy right now. Retrying shortly…")
     finished_at = time.perf_counter()
     if not predictions:
         return jsonify({"error": "The model could not score this recording. Please try again."}), 500
 
+    count("predictions")
     timing["model_prediction_seconds"] = round(finished_at - inference_started_at, 3)
     timing["total_seconds"] = round(finished_at - started_at, 3)
     app.logger.info(
@@ -553,28 +768,40 @@ def prediction_response(frames, timestamps_ms, aspect_ratio, timing, started_at)
 def predict_landmarks():
     """Classifies landmarks extracted in the browser (float32 [frames, 543, 3])."""
     started_at = time.perf_counter()
-    try:
-        frames, timestamps = parse_landmark_upload(
-            request.get_data(cache=False), request.headers.get("X-Frame-Count")
-        )
-        aspect_ratio = parse_aspect_ratio(request.headers.get("X-Frame-Aspect"))
-    except PredictionInputError as error:
-        return jsonify({"error": str(error)}), 400
+    with prediction_gate.admit() as admitted:
+        if not admitted:
+            return busy_response("The prediction server is busy right now. Retrying shortly…")
+        try:
+            frames, timestamps = parse_landmark_upload(
+                request.get_data(cache=False),
+                request.headers.get("X-Frame-Count"),
+                request.headers.get("X-Landmark-Layout"),
+            )
+            aspect_ratio = parse_aspect_ratio(request.headers.get("X-Frame-Aspect"))
+        except PredictionInputError as error:
+            return jsonify({"error": str(error)}), 400
 
-    load_model()
-    return prediction_response(
-        frames,
-        timestamps,
-        aspect_ratio,
-        {"parse_seconds": round(time.perf_counter() - started_at, 3)},
-        started_at,
-    )
+        load_model()
+        return prediction_response(
+            frames,
+            timestamps,
+            aspect_ratio,
+            {"parse_seconds": round(time.perf_counter() - started_at, 3)},
+            started_at,
+        )
 
 
 @app.route("/predict", methods=["POST"])
 def predict():
     """Fallback: extracts landmarks from an uploaded clip on the server."""
     started_at = time.perf_counter()
+    with video_gate.admit() as admitted:
+        if not admitted:
+            return busy_response("The prediction server is busy with other recordings. Retrying shortly…")
+        return predict_video(started_at)
+
+
+def predict_video(started_at):
     file = request.files.get("video")
     if file is None:
         return jsonify({"error": "No video uploaded"}), 400
@@ -591,6 +818,8 @@ def predict():
         frames, timestamps, aspect_ratio = process_video(video_path)
     except PredictionInputError as error:
         return jsonify({"error": str(error)}), 422
+    except ServerBusy:
+        return busy_response("The prediction server is busy with other recordings. Retrying shortly…")
     finally:
         try:
             os.remove(video_path)
@@ -616,6 +845,13 @@ def health():
         "status": "ok",
         "model_loaded": prediction_fn is not None,
         "video_fallback_loaded": holistic is not None,
+        "capacity": {
+            "interpreters": INFERENCE_WORKERS,
+            "interpreters_free": interpreter_pool.qsize(),
+            "landmark_requests_in_flight": prediction_gate.active,
+            "video_requests_in_flight": video_gate.active,
+        },
+        "stats": dict(stats),
     })
 
 

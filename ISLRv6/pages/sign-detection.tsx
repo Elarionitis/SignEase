@@ -1,7 +1,15 @@
 import PixelCard from "@/components/PixelCard";
 import Background from "@/components/background";
+import { Celebration } from "@/components/detection/Celebration";
+import {
+  PracticeCard,
+  type PracticeOutcome,
+  type PracticeSign,
+} from "@/components/detection/PracticeCard";
+import { SessionHistory, type HistoryEntry } from "@/components/detection/SessionHistory";
 import { Button } from "@/components/ui/button";
 import { Slider } from "@/components/ui/slider";
+import { Switch } from "@/components/ui/switch";
 import { useBackendStatus } from "@/hooks/useBackendStatus";
 import { SLOW_FRAME_MS, useHolisticTracker, type TrackerStatus } from "@/hooks/useHolisticTracker";
 import {
@@ -10,18 +18,32 @@ import {
   type PredictionResponse,
   type SignPrediction,
 } from "@/lib/api";
-import { packFrames, type LandmarkFrame } from "@/lib/holistic";
+import { COMPACT_LAYOUT, packFrames, packFullFrames, type LandmarkFrame } from "@/lib/holistic";
 import { cn } from "@/lib/utils";
 import { motion } from "framer-motion";
 import type { NormalizedLandmarkList } from "@mediapipe/holistic";
+import fs from "fs";
+import type { GetStaticProps } from "next";
 import Head from "next/head";
 import Image from "next/image";
 import Link from "next/link";
 import * as React from "react";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { FaArrowRight, FaCamera, FaExclamationTriangle, FaHandPaper, FaStop } from "react-icons/fa";
+import {
+  FaArrowRight,
+  FaCamera,
+  FaCheckCircle,
+  FaExclamationTriangle,
+  FaGraduationCap,
+  FaHandPaper,
+  FaKeyboard,
+  FaMagic,
+  FaStop,
+} from "react-icons/fa";
 import { IoRefreshOutline, IoVolumeHigh } from "react-icons/io5";
 import Webcam from "react-webcam";
+import path from "path";
+import signMap from "@/data/sign_to_prediction_index_map.json";
 
 const pacifico = { className: "font-serif", variable: "font-serif" };
 const inter = { variable: "font-sans" };
@@ -57,6 +79,12 @@ const RECORDER_MIME_TYPES = [
 // the live preview for CPU and encoder resources.
 const RECORDING_BITS_PER_SECOND = 600_000;
 const WELCOME_SPEECH_SESSION_KEY = "welcomeMessagePlayed";
+const COUNTDOWN_SECONDS = 3;
+const COUNTDOWN_PREFERENCE_KEY = "signease:countdown";
+const BEST_STREAK_KEY = "signease:bestStreak";
+const MAX_HISTORY = 12;
+// Common, distinctive signs to start the practice challenge with.
+const STARTER_SIGNS = ["hello", "thankyou", "yes", "no", "bye", "drink", "happy", "eat", "milk", "mom", "dad", "please"];
 const WELCOME_MESSAGE =
   "Welcome to SignEase! To start sign language detection, position yourself clearly in the camera view, adjust the recording duration using the slider if needed, and click the Start Recording button. For best results, ensure good lighting and perform clear, deliberate gestures.";
 
@@ -68,7 +96,78 @@ const HAND_CONNECTIONS: ReadonlyArray<[number, number]> = [
   [13, 17], [0, 17], [17, 18], [18, 19], [19, 20],
 ];
 
-type Phase = "idle" | "recording" | "processing" | "result" | "error";
+type Phase = "idle" | "countdown" | "recording" | "processing" | "result" | "error";
+type Mode = "free" | "practice";
+
+interface SignDetectionProps {
+  practiceSigns: PracticeSign[];
+}
+
+// Practice uses the signs that have a demo clip, known at build time.
+export const getStaticProps: GetStaticProps<SignDetectionProps> = async () => {
+  const videoDir = path.join(process.cwd(), "public", "videos", "signs");
+  const videos = new Set(
+    fs.existsSync(videoDir) ? fs.readdirSync(videoDir).filter((file) => file.endsWith(".mp4")) : []
+  );
+  const withVideo = Object.entries(signMap as Record<string, number>)
+    .filter(([, index]) => videos.has(`${index}.mp4`))
+    .map(([name, index]) => ({ name, index }));
+  const starters = STARTER_SIGNS.flatMap((name) => withVideo.filter((sign) => sign.name === name));
+  const rest = withVideo
+    .filter((sign) => !STARTER_SIGNS.includes(sign.name))
+    .sort((a, b) => a.name.localeCompare(b.name));
+  return { props: { practiceSigns: [...starters, ...rest] } };
+};
+
+function shuffled<T>(items: T[]) {
+  const copy = [...items];
+  for (let i = copy.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [copy[i], copy[j]] = [copy[j], copy[i]];
+  }
+  return copy;
+}
+
+function readStorage(key: string) {
+  try {
+    return window.localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
+function writeStorage(key: string, value: string) {
+  try {
+    window.localStorage.setItem(key, value);
+  } catch {
+    // Private mode or blocked storage: the preference just isn't remembered.
+  }
+}
+
+let audioContext: AudioContext | null = null;
+
+/** A short tone for the countdown. Created on a click, so autoplay allows it. */
+function beep(frequency: number, durationMs = 120) {
+  try {
+    const AudioContextClass =
+      window.AudioContext || (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+    if (!AudioContextClass) return;
+    audioContext ??= new AudioContextClass();
+    const oscillator = audioContext.createOscillator();
+    const gain = audioContext.createGain();
+    oscillator.frequency.value = frequency;
+    oscillator.type = "sine";
+    const now = audioContext.currentTime;
+    gain.gain.setValueAtTime(0.0001, now);
+    gain.gain.exponentialRampToValueAtTime(0.15, now + 0.01);
+    gain.gain.exponentialRampToValueAtTime(0.0001, now + durationMs / 1000);
+    oscillator.connect(gain).connect(audioContext.destination);
+    oscillator.start(now);
+    oscillator.stop(now + durationMs / 1000 + 0.02);
+  } catch {
+    // Sound is a nicety; ignore browsers that refuse it.
+  }
+}
 type PredictionMode = "on-device" | "server";
 
 interface RecognitionResult {
@@ -105,6 +204,16 @@ function getRecordingExtension(mimeType: string) {
 
 function formatSign(sign: string) {
   return sign.replace(/_/g, " ");
+}
+
+function isTypingTarget(target: EventTarget | null) {
+  if (!(target instanceof HTMLElement)) return false;
+  return (
+    target.isContentEditable ||
+    ["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName) ||
+    target.getAttribute("role") === "slider" ||
+    target.getAttribute("role") === "switch"
+  );
 }
 
 /**
@@ -284,7 +393,7 @@ function ElegantShape({
   );
 }
 
-const SignDetection: React.FC = () => {
+const SignDetection: React.FC<SignDetectionProps> = ({ practiceSigns }) => {
   const webcamRef = useRef<Webcam>(null);
   const overlayRef = useRef<HTMLCanvasElement>(null);
   const sessionRef = useRef<RecordingSession | null>(null);
@@ -300,6 +409,26 @@ const SignDetection: React.FC = () => {
   const [cameraReady, setCameraReady] = useState<boolean>(false);
   const [cameraError, setCameraError] = useState<string>("");
   const [cameraKey, setCameraKey] = useState<number>(0);
+  const [countdown, setCountdown] = useState<number | null>(null);
+  const [useCountdown, setUseCountdown] = useState<boolean>(true);
+  const [retryNotice, setRetryNotice] = useState<string>("");
+  const countdownTimerRef = useRef<number | null>(null);
+
+  // Practice challenge and session history
+  const [mode, setMode] = useState<Mode>("free");
+  const [practiceQueue, setPracticeQueue] = useState<PracticeSign[]>(practiceSigns);
+  const [practiceIndex, setPracticeIndex] = useState<number>(0);
+  const [practiceOutcome, setPracticeOutcome] = useState<PracticeOutcome>(null);
+  const [streak, setStreak] = useState<number>(0);
+  const [bestStreak, setBestStreak] = useState<number>(0);
+  const [practiceMatched, setPracticeMatched] = useState<number>(0);
+  const [practiceAttempts, setPracticeAttempts] = useState<number>(0);
+  const [celebrationKey, setCelebrationKey] = useState<number>(0);
+  const [history, setHistory] = useState<HistoryEntry[]>([]);
+  const historyIdRef = useRef(0);
+  const practiceTarget = mode === "practice" ? practiceQueue[practiceIndex % Math.max(1, practiceQueue.length)] : undefined;
+  const practiceTargetRef = useRef<PracticeSign | undefined>(undefined);
+  practiceTargetRef.current = practiceTarget;
 
   // Speech state
   const [hasPlayedWelcome, setHasPlayedWelcome] = useState<boolean>(false);
@@ -310,7 +439,29 @@ const SignDetection: React.FC = () => {
   const welcomeSpeechAttemptedRef = useRef(false);
 
   const isRecording = phase === "recording";
-  const isBusy = phase === "recording" || phase === "processing";
+  // Matches Tailwind's lg breakpoint, where the results move beside the camera.
+  const [isNarrow, setIsNarrow] = useState<boolean>(false);
+  useEffect(() => {
+    const query = window.matchMedia("(max-width: 1023px)");
+    const update = () => setIsNarrow(query.matches);
+    update();
+    query.addEventListener?.("change", update);
+    return () => query.removeEventListener?.("change", update);
+  }, []);
+  const isCountingDown = phase === "countdown";
+  const isBusy = phase === "countdown" || phase === "recording" || phase === "processing";
+
+  // Restore preferences, and keep the starter signs first but vary the rest.
+  useEffect(() => {
+    if (readStorage(COUNTDOWN_PREFERENCE_KEY) === "off") setUseCountdown(false);
+    const best = Number(readStorage(BEST_STREAK_KEY));
+    if (Number.isFinite(best) && best > 0) setBestStreak(best);
+    const starterCount = practiceSigns.filter((sign) => STARTER_SIGNS.includes(sign.name)).length;
+    setPracticeQueue([
+      ...shuffled(practiceSigns.slice(0, starterCount)),
+      ...shuffled(practiceSigns.slice(starterCount)),
+    ]);
+  }, [practiceSigns]);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -468,6 +619,7 @@ const SignDetection: React.FC = () => {
   useEffect(() => {
     return () => {
       speechSynthesisRef.current?.cancel();
+      if (countdownTimerRef.current) window.clearInterval(countdownTimerRef.current);
       const session = sessionRef.current;
       if (session) {
         session.active = false;
@@ -609,26 +761,42 @@ const SignDetection: React.FC = () => {
         return;
       } else if (enoughHandFrames && (trackingUsable || !videoBlob)) {
         mode = "on-device";
-        response = await requestPrediction(
-          "/predict-landmarks",
-          packFrames(session.handFrames, session.handFrameTimes),
-          {
-            signal: session.abort.signal,
-            headers: {
-              "Content-Type": "application/octet-stream",
-              "X-Frame-Count": String(session.handFrames.length),
-              // Landmarks are fractions of the frame size, so the server
-              // needs the frame shape to undo the stretching.
-              "X-Frame-Aspect": session.frameAspect.toFixed(4),
-            },
-          }
-        );
+        const landmarkHeaders = {
+          "Content-Type": "application/octet-stream",
+          "X-Frame-Count": String(session.handFrames.length),
+          // Landmarks are fractions of the frame size, so the server
+          // needs the frame shape to undo the stretching.
+          "X-Frame-Aspect": session.frameAspect.toFixed(4),
+        };
+        try {
+          response = await requestPrediction(
+            "/predict-landmarks",
+            packFrames(session.handFrames, session.handFrameTimes),
+            {
+              signal: session.abort.signal,
+              headers: { ...landmarkHeaders, "X-Landmark-Layout": COMPACT_LAYOUT },
+              onRetry: setRetryNotice,
+            }
+          );
+        } catch (error) {
+          // A server deployed before the compact layout rejects it as a
+          // malformed upload; send full frames instead.
+          if (!(error instanceof PredictionError) || error.status !== 400) throw error;
+          response = await requestPrediction(
+            "/predict-landmarks",
+            packFullFrames(session.handFrames, session.handFrameTimes),
+            { signal: session.abort.signal, headers: landmarkHeaders, onRetry: setRetryNotice }
+          );
+        }
       } else if (videoBlob) {
         // Hand tracking was unavailable or too slow on this device.
         mode = "server";
         const formData = new FormData();
         formData.append("video", videoBlob, `sign_${Date.now()}.${getRecordingExtension(videoBlob.type)}`);
-        response = await requestPrediction("/predict", formData, { signal: session.abort.signal });
+        response = await requestPrediction("/predict", formData, {
+          signal: session.abort.signal,
+          onRetry: setRetryNotice,
+        });
       } else {
         showError(
           session.trackingLoop
@@ -649,11 +817,51 @@ const SignDetection: React.FC = () => {
       setResult({ sign: response.sign, confidence: response.confidence, alternatives, mode });
       setErrorMessage("");
       setPhase("result");
-      speak(
-        response.confidence >= LOW_CONFIDENCE
-          ? `Predicted sign is ${formatSign(response.sign)}`
-          : `Possibly ${formatSign(response.sign)}`
-      );
+
+      const target = practiceTargetRef.current;
+      const matched = !!target && response.sign === target.name;
+      historyIdRef.current += 1;
+      const entry: HistoryEntry = {
+        id: historyIdRef.current,
+        sign: response.sign,
+        confidence: response.confidence,
+        matched,
+      };
+      setHistory((entries) => [...entries, entry].slice(-MAX_HISTORY));
+
+      if (target) {
+        const close = !matched && alternatives.some((alternative) => alternative.sign === target.name);
+        setPracticeOutcome(matched ? "match" : close ? "close" : "miss");
+        setPracticeAttempts((value) => value + 1);
+        if (matched) {
+          setPracticeMatched((value) => value + 1);
+          setCelebrationKey((value) => value + 1);
+          setStreak((value) => {
+            const next = value + 1;
+            setBestStreak((best) => {
+              if (next <= best) return best;
+              writeStorage(BEST_STREAK_KEY, String(next));
+              return next;
+            });
+            return next;
+          });
+          speak(`Great job! That was ${formatSign(target.name)}`);
+        } else {
+          setStreak(0);
+          speak(
+            close
+              ? `So close! I saw ${formatSign(response.sign)}. Try ${formatSign(target.name)} again`
+              : `I saw ${formatSign(response.sign)}. Watch the demo and try again`
+          );
+        }
+      } else {
+        if (response.confidence >= 0.8) setCelebrationKey((value) => value + 1);
+        speak(
+          response.confidence >= LOW_CONFIDENCE
+            ? `Predicted sign is ${formatSign(response.sign)}`
+            : `Possibly ${formatSign(response.sign)}`
+        );
+      }
     } catch (error: unknown) {
       if (error instanceof DOMException && error.name === "AbortError") {
         if (mountedRef.current) showError("Prediction timed out. Please try again.");
@@ -667,14 +875,17 @@ const SignDetection: React.FC = () => {
       );
     } finally {
       window.clearTimeout(timeoutId);
+      if (mountedRef.current) setRetryNotice("");
       if (sessionRef.current === session) sessionRef.current = null;
     }
   }, [showError, speak]);
 
-  const startRecording = useCallback(
-    (event: React.MouseEvent) => {
-      event.preventDefault();
-      if (isBusy || trackerStatus === "loading" || trackerStatus === "calibrating") return;
+  const beginRecording = useCallback(
+    () => {
+      if (trackerStatus === "loading" || trackerStatus === "calibrating") {
+        setPhase("idle");
+        return;
+      }
 
       const video = webcamRef.current?.video;
       const stream = video?.srcObject;
@@ -716,14 +927,112 @@ const SignDetection: React.FC = () => {
       setResult(null);
       setErrorMessage("");
       setElapsed(0);
+      setPracticeOutcome(null);
       setPhase("recording");
     },
-    [duration, finishRecording, isBusy, runTrackingLoop, showError, trackerRef, trackerStatus]
+    [duration, finishRecording, runTrackingLoop, showError, trackerRef, trackerStatus]
   );
+  const beginRecordingRef = useRef(beginRecording);
+  beginRecordingRef.current = beginRecording;
+
+  const cancelCountdown = useCallback(() => {
+    if (countdownTimerRef.current) window.clearInterval(countdownTimerRef.current);
+    countdownTimerRef.current = null;
+    setCountdown(null);
+    setPhase((current) => (current === "countdown" ? "idle" : current));
+  }, []);
+
+  const startRecording = useCallback(() => {
+    if (isBusy || trackerStatus === "loading" || trackerStatus === "calibrating" || !cameraReady) return;
+
+    speechSynthesisRef.current?.cancel();
+    setIsSpeaking(false);
+    if (!useCountdown) {
+      beep(880, 160);
+      beginRecordingRef.current();
+      return;
+    }
+
+    // A short countdown gives time to get the hands into position, so the
+    // recording starts on the sign instead of on raising the hands.
+    let remaining = COUNTDOWN_SECONDS;
+    setResult(null);
+    setErrorMessage("");
+    setPracticeOutcome(null);
+    setCountdown(remaining);
+    setPhase("countdown");
+    beep(587);
+    countdownTimerRef.current = window.setInterval(() => {
+      remaining -= 1;
+      if (remaining > 0) {
+        setCountdown(remaining);
+        beep(587);
+        return;
+      }
+      if (countdownTimerRef.current) window.clearInterval(countdownTimerRef.current);
+      countdownTimerRef.current = null;
+      setCountdown(null);
+      beep(880, 200);
+      beginRecordingRef.current();
+    }, 1000);
+  }, [cameraReady, isBusy, trackerStatus, useCountdown]);
+
+  const toggleCountdown = () => {
+    setUseCountdown((value) => {
+      writeStorage(COUNTDOWN_PREFERENCE_KEY, value ? "off" : "on");
+      return !value;
+    });
+  };
+
+  const nextPracticeSign = useCallback(() => {
+    setPracticeIndex((index) => index + 1);
+    setPracticeOutcome(null);
+    setResult(null);
+    setErrorMessage("");
+    setPhase((current) => (current === "result" || current === "error" ? "idle" : current));
+  }, []);
+
+  const switchMode = (next: Mode) => {
+    if (isBusy || next === mode) return;
+    setMode(next);
+    setPracticeOutcome(null);
+    setResult(null);
+    setErrorMessage("");
+    setPhase("idle");
+  };
+
+  const speakHistory = () => {
+    if (history.length) speak(history.map((entry) => formatSign(entry.sign)).join(" "));
+  };
+
+  // Space starts a recording (or stops / cancels one) from anywhere on the
+  // page, including while a button has focus after being clicked.
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.code !== "Space" || isTypingTarget(event.target)) return;
+      event.preventDefault();
+      if (event.repeat) return;
+      if (phase === "countdown") cancelCountdown();
+      else if (phase === "recording") void finishRecording();
+      else startRecording();
+    };
+    // A focused button "clicks" on Space keyup; cancel that so the key does
+    // not also press whatever button was clicked last.
+    const onKeyUp = (event: KeyboardEvent) => {
+      if (event.code === "Space" && !isTypingTarget(event.target)) event.preventDefault();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    window.addEventListener("keyup", onKeyUp);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener("keyup", onKeyUp);
+    };
+  }, [cancelCountdown, finishRecording, phase, startRecording]);
 
   const resetResult = () => {
     setResult(null);
     setErrorMessage("");
+    setPracticeOutcome(null);
     setPhase("idle");
   };
 
@@ -769,6 +1078,19 @@ const SignDetection: React.FC = () => {
       ease: "easeInOut"
     }
   };
+
+  const practiceCard = practiceTarget ? (
+    <PracticeCard
+      target={practiceTarget}
+      outcome={practiceOutcome}
+      streak={streak}
+      bestStreak={bestStreak}
+      matched={practiceMatched}
+      attempts={practiceAttempts}
+      disabled={isBusy}
+      onNext={nextPracticeSign}
+    />
+  ) : null;
 
   const shownSeconds = Math.min(duration, Math.floor(elapsed));
   const confidencePercent = result ? Math.round(result.confidence * 1000) / 10 : 0;
@@ -1045,9 +1367,54 @@ const SignDetection: React.FC = () => {
                   whileHover={{ boxShadow: "0 0 25px rgba(255,255,255,0.08)" }}
                   transition={{ duration: 0.5 }}
                 >
+                  <div className="mb-6 flex flex-col items-center gap-3 sm:flex-row sm:justify-between">
+                    <div
+                      role="tablist"
+                      aria-label="Detection mode"
+                      className="relative grid grid-cols-2 rounded-full border border-white/10 bg-black/30 p-1"
+                    >
+                      {([
+                        { value: "free", label: "Free signing", icon: <FaMagic /> },
+                        { value: "practice", label: "Practice challenge", icon: <FaGraduationCap /> },
+                      ] as const).map((option) => (
+                        <button
+                          key={option.value}
+                          type="button"
+                          role="tab"
+                          aria-selected={mode === option.value}
+                          disabled={isBusy || (option.value === "practice" && practiceSigns.length === 0)}
+                          onClick={() => switchMode(option.value)}
+                          className={cn(
+                            "relative z-10 flex items-center justify-center gap-2 rounded-full px-4 py-2 text-sm font-medium transition-colors disabled:cursor-not-allowed",
+                            mode === option.value ? "text-white" : "text-white/60 hover:text-white/90"
+                          )}
+                        >
+                          {mode === option.value && (
+                            <motion.span
+                              layoutId="mode-pill"
+                              className="absolute inset-0 -z-10 rounded-full bg-gradient-to-r from-indigo-500/80 to-rose-500/80"
+                              transition={{ type: "spring", stiffness: 400, damping: 30 }}
+                            />
+                          )}
+                          {option.icon}
+                          <span className="whitespace-nowrap">{option.label}</span>
+                        </button>
+                      ))}
+                    </div>
+                    <p className="hidden items-center gap-2 text-xs text-white/40 sm:flex">
+                      <FaKeyboard /> Press
+                      <kbd className="rounded border border-white/20 bg-white/5 px-1.5 py-0.5 font-sans text-[11px] text-white/70">
+                        Space
+                      </kbd>
+                      to start or stop
+                    </p>
+                  </div>
+
                   <div className="flex flex-col lg:flex-row gap-8">
                     {/* Webcam section with enhanced styling */}
                     <div className="flex-1 min-w-0 relative">
+                      {/* On phones the challenge sits above the camera so it stays in view. */}
+                      {practiceTarget && isNarrow && practiceCard}
                       <motion.div
                         className="rounded-xl overflow-hidden relative aspect-video bg-gradient-to-br from-black/30 to-black/10 border border-white/10"
                         whileHover={{ borderColor: "rgba(255,255,255,0.2)" }}
@@ -1100,6 +1467,25 @@ const SignDetection: React.FC = () => {
                                 <p className="text-sm text-white/70">Waiting for camera access…</p>
                               </>
                             )}
+                          </div>
+                        )}
+
+                        {isCountingDown && countdown !== null && (
+                          <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/40 backdrop-blur-[2px]">
+                            <motion.span
+                              key={countdown}
+                              initial={{ scale: 1.8, opacity: 0 }}
+                              animate={{ scale: 1, opacity: 1 }}
+                              transition={{ type: "spring", stiffness: 260, damping: 18 }}
+                              className="text-8xl font-bold text-white drop-shadow-[0_0_30px_rgba(129,140,248,0.6)] tabular-nums"
+                            >
+                              {countdown}
+                            </motion.span>
+                            <p className="mt-3 text-sm text-white/80">
+                              {practiceTarget
+                                ? `Get ready to sign “${formatSign(practiceTarget.name)}”`
+                                : "Get your hands ready"}
+                            </p>
                           </div>
                         )}
 
@@ -1181,7 +1567,16 @@ const SignDetection: React.FC = () => {
                       </div>
 
                       <div className="mt-5 flex flex-wrap justify-center gap-4">
-                        {!isRecording ? (
+                        {isCountingDown ? (
+                          <Button
+                            type="button"
+                            onClick={cancelCountdown}
+                            variant="outline"
+                            className="bg-white/5 hover:bg-white/10 border-white/20 text-white px-8 py-6 rounded-full"
+                          >
+                            Cancel countdown
+                          </Button>
+                        ) : !isRecording ? (
                           <motion.div
                             whileHover={startDisabled ? undefined : { scale: 1.05 }}
                             whileTap={startDisabled ? undefined : { scale: 0.95 }}
@@ -1194,12 +1589,14 @@ const SignDetection: React.FC = () => {
                               className="bg-gradient-to-r from-indigo-500 to-rose-500 hover:opacity-90 text-white transition-all flex items-center gap-3 px-8 py-6 rounded-full shadow-lg shadow-indigo-500/20"
                             >
                               <FaCamera className="text-lg" />
-                              <span className="text-base font-medium">
+                              <span className="text-base font-medium capitalize">
                                 {phase === "processing"
                                   ? "Analyzing…"
                                   : trackerPreparing && cameraReady
                                     ? "Preparing…"
-                                    : "Start Recording"}
+                                    : practiceTarget
+                                      ? `Sign “${formatSign(practiceTarget.name)}”`
+                                      : "Start Recording"}
                               </span>
                             </Button>
                           </motion.div>
@@ -1264,6 +1661,20 @@ const SignDetection: React.FC = () => {
                           aria-labelledby="recording-duration-label"
                           className="relative z-10"
                         />
+                        <label className="mt-5 flex cursor-pointer items-center justify-between gap-3 text-sm text-white/70">
+                          <span>
+                            {COUNTDOWN_SECONDS}-second countdown before recording
+                            <span className="block text-xs text-white/40">
+                              Time to get your hands into position
+                            </span>
+                          </span>
+                          <Switch
+                            checked={useCountdown}
+                            onCheckedChange={toggleCountdown}
+                            disabled={isBusy}
+                            className="data-[state=checked]:bg-indigo-500 data-[state=unchecked]:bg-white/15"
+                          />
+                        </label>
                       </div>
 
                       <div className="mt-12 pt-4 border-t border-white/10">
@@ -1308,16 +1719,26 @@ const SignDetection: React.FC = () => {
 
                     {/* Result section */}
                     <div className="flex-1 min-w-0 flex flex-col lg:border-l lg:border-white/10 lg:pl-8">
+                      {practiceTarget && !isNarrow && practiceCard}
                       <h3 className="text-2xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-indigo-300 via-white/90 to-rose-300 mb-6">
                         Recognition Results
                       </h3>
 
                       <div className="flex-1 flex flex-col">
                         <div
-                          className="bg-white/[0.02] border border-white/[0.05] rounded-xl p-6 h-full min-h-[280px] flex flex-col"
+                          className="relative bg-white/[0.02] border border-white/[0.05] rounded-xl p-6 h-full min-h-[280px] flex flex-col"
                           aria-live="polite"
                         >
-                          {phase === "recording" ? (
+                          {phase === "result" && celebrationKey > 0 && (
+                            <Celebration key={celebrationKey} />
+                          )}
+                          {phase === "countdown" ? (
+                            <div className="flex-1 flex items-center justify-center flex-col text-center">
+                              <FaHandPaper className="text-4xl text-indigo-300/80 animate-bounce" />
+                              <p className="mt-5 text-white/70">Recording starts in {countdown}…</p>
+                              <p className="mt-2 text-xs text-white/40">Start signing when the timer turns red</p>
+                            </div>
+                          ) : phase === "recording" ? (
                             <div className="flex-1 flex items-center justify-center flex-col">
                               <div className="w-16 h-16 rounded-full border-4 border-indigo-500/20 border-t-indigo-500 animate-spin" />
                               <motion.p
@@ -1352,7 +1773,10 @@ const SignDetection: React.FC = () => {
                               >
                                 AI model processing…
                               </motion.p>
-                              {backendStatus !== "ready" && (
+                              {retryNotice && (
+                                <p className="mt-3 max-w-xs text-center text-xs text-sky-200/80">{retryNotice}</p>
+                              )}
+                              {backendStatus !== "ready" && !retryNotice && (
                                 <p className="mt-3 max-w-xs text-center text-xs text-amber-200/80">
                                   The prediction server is waking up after being idle. This first
                                   result can take up to a minute; the next ones are instant.
@@ -1381,6 +1805,30 @@ const SignDetection: React.FC = () => {
                               animate={{ opacity: 1 }}
                               transition={{ duration: 0.5 }}
                             >
+                              {practiceOutcome && practiceTarget && (
+                                <motion.div
+                                  initial={{ opacity: 0, y: -10, scale: 0.95 }}
+                                  animate={{ opacity: 1, y: 0, scale: 1 }}
+                                  className={cn(
+                                    "mb-5 flex items-center gap-2 rounded-full border px-4 py-2 text-sm font-medium",
+                                    practiceOutcome === "match"
+                                      ? "border-emerald-400/30 bg-emerald-500/15 text-emerald-100"
+                                      : practiceOutcome === "close"
+                                        ? "border-sky-400/30 bg-sky-500/10 text-sky-100"
+                                        : "border-amber-400/30 bg-amber-500/10 text-amber-100"
+                                  )}
+                                >
+                                  {practiceOutcome === "match" ? (
+                                    <>
+                                      <FaCheckCircle /> Nailed it! +1 streak
+                                    </>
+                                  ) : practiceOutcome === "close" ? (
+                                    <>So close: “{formatSign(practiceTarget.name)}” was a runner-up</>
+                                  ) : (
+                                    <>Not quite: watch the demo and try again</>
+                                  )}
+                                </motion.div>
+                              )}
                               <motion.button
                                 type="button"
                                 onClick={() => speak(`Predicted sign is ${formatSign(result.sign)}`)}
@@ -1457,12 +1905,23 @@ const SignDetection: React.FC = () => {
                                   </div>
                                 )}
 
-                                <Link
-                                  href={`/dictionary?query=${encodeURIComponent(result.sign)}`}
-                                  className="inline-flex items-center gap-2 text-sm text-indigo-300 hover:text-indigo-200"
-                                >
-                                  See how to sign it <FaArrowRight className="text-xs" />
-                                </Link>
+                                <div className="flex flex-wrap items-center justify-center gap-4">
+                                  {practiceOutcome === "match" && (
+                                    <Button
+                                      type="button"
+                                      onClick={nextPracticeSign}
+                                      className="rounded-full bg-gradient-to-r from-emerald-500 to-teal-500 px-5 text-white hover:opacity-90"
+                                    >
+                                      Next challenge <FaArrowRight className="ml-2 text-xs" />
+                                    </Button>
+                                  )}
+                                  <Link
+                                    href={`/dictionary?query=${encodeURIComponent(result.sign)}`}
+                                    className="inline-flex items-center gap-2 text-sm text-indigo-300 hover:text-indigo-200"
+                                  >
+                                    See how to sign it <FaArrowRight className="text-xs" />
+                                  </Link>
+                                </div>
                               </motion.div>
                             </motion.div>
                           ) : (
@@ -1483,15 +1942,32 @@ const SignDetection: React.FC = () => {
                                 <FaHandPaper className="text-3xl text-white/40" />
                               </motion.div>
                               <h4 className="text-xl font-medium text-white/80 mb-3">
-                                No Sign Detected
+                                {practiceTarget ? "Ready when you are" : "No Sign Detected"}
                               </h4>
                               <p className="mt-2 text-white/50 max-w-md">
-                                Make a sign gesture in front of the camera and
-                                click &quot;Start Recording&quot; to begin.
+                                {practiceTarget
+                                  ? `Watch the demo above, then press the button and sign “${formatSign(practiceTarget.name)}”.`
+                                  : "Make a sign gesture in front of the camera and click \"Start Recording\" to begin."}
                               </p>
+                              {!practiceTarget && practiceSigns.length > 0 && (
+                                <button
+                                  type="button"
+                                  onClick={() => switchMode("practice")}
+                                  className="mt-5 inline-flex items-center gap-2 rounded-full border border-indigo-400/30 bg-indigo-500/10 px-4 py-2 text-sm text-indigo-100 transition-colors hover:bg-indigo-500/20"
+                                >
+                                  <FaGraduationCap /> Not sure what to sign? Try a challenge
+                                </button>
+                              )}
                             </motion.div>
                           )}
                         </div>
+
+                        <SessionHistory
+                          entries={history}
+                          onSpeakAll={speakHistory}
+                          onClear={() => setHistory([])}
+                          lowConfidence={LOW_CONFIDENCE}
+                        />
 
                         <motion.div
                           className="mt-6 bg-white/[0.02] border border-white/[0.05] rounded-xl p-5"
@@ -1511,9 +1987,10 @@ const SignDetection: React.FC = () => {
                             {[
                               "Position yourself so your face and both hands are in the camera view",
                               `Use the slider to adjust the recording duration (${MIN_RECORDING_DURATION}-${MAX_RECORDING_DURATION} seconds)`,
-                              'Click the "Start Recording" button and perform your sign gesture',
+                              'Click "Start Recording" (or press Space); a short countdown gives you time to get ready',
                               "Perform the whole sign before the recording completes",
                               "Your sign language translation appears right after recording",
+                              'Not sure what to sign? Switch to "Practice challenge", copy the demo and build a streak',
                             ].map((step, index) => (
                               <motion.li
                                 key={step}

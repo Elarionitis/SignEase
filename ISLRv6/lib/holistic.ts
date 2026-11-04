@@ -174,12 +174,53 @@ export function loadHolisticTracker() {
   return trackerPromise;
 }
 
+// The rows the classifier and the server's segment finder read: 40 lip
+// points, both hands, both shoulders and 5 points of each arm. Uploading only
+// these ("compact-v1") is ~6x smaller than full frames, with identical
+// predictions. Keep in sync with COMPACT_ROWS in Ml/backend.py.
+const LIP_ROWS = [
+  61, 185, 40, 39, 37, 0, 267, 269, 270, 409, 291, 146, 91, 181, 84, 17, 314, 405, 321, 375,
+  78, 191, 80, 81, 82, 13, 312, 311, 310, 415, 95, 88, 178, 87, 14, 317, 402, 318, 324, 308,
+];
+const range = (start: number, end: number) =>
+  Array.from({ length: end - start }, (_, index) => start + index);
+const COMPACT_ROWS = [
+  ...LIP_ROWS,
+  ...range(468, 489),
+  ...range(522, 543),
+  500,
+  501,
+  ...range(502, 512),
+];
+export const COMPACT_LAYOUT = "compact-v1";
+const COMPACT_VALUES = COMPACT_ROWS.length * 3;
+
 /**
- * Packs frames as float32 [frames, 543, 3] followed by one float32 capture
- * time (ms since the first frame) per frame, for /predict-landmarks. The
- * server uses the times to resample the sequence to the model's 30 fps.
+ * Packs frames as float32 [frames, rows, 3] (only the compact rows) followed
+ * by one float32 capture time (ms since the first frame) per frame, for
+ * /predict-landmarks. The server uses the times to resample the sequence to
+ * the model's 30 fps.
  */
 export function packFrames(frames: Float32Array[], timesMs: number[]) {
+  const packed = new Float32Array(frames.length * (COMPACT_VALUES + 1));
+  frames.forEach((frame, index) => {
+    let offset = index * COMPACT_VALUES;
+    for (const row of COMPACT_ROWS) {
+      packed[offset] = frame[row * 3];
+      packed[offset + 1] = frame[row * 3 + 1];
+      packed[offset + 2] = frame[row * 3 + 2];
+      offset += 3;
+    }
+  });
+  const start = timesMs[0] ?? 0;
+  timesMs.forEach((time, index) => {
+    packed[frames.length * COMPACT_VALUES + index] = time - start;
+  });
+  return packed;
+}
+
+/** Full [frames, 543, 3] layout, for servers that predate compact-v1. */
+export function packFullFrames(frames: Float32Array[], timesMs: number[]) {
   const packed = new Float32Array(frames.length * (FRAME_VALUES + 1));
   frames.forEach((frame, index) => packed.set(frame, index * FRAME_VALUES));
   const start = timesMs[0] ?? 0;

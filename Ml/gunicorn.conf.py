@@ -1,15 +1,21 @@
 import os
 
 bind = f"0.0.0.0:{os.environ.get('PORT', '5000')}"
-# One worker keeps a single copy of the model in memory on the small Render
-# instance. Threads let /health and /warmup answer while a prediction runs;
-# the model and MediaPipe are guarded by locks in backend.py.
+# One worker keeps the model in memory once on the small Render instance.
+# Inside it, INFERENCE_WORKERS interpreters (backend.py) run predictions in
+# parallel and the extra threads keep /health and /warmup answering while
+# they run. Requests beyond the backend's queue limits get a fast 503 with
+# Retry-After, which the browser retries. To scale out, add instances (the
+# API is stateless, so Render's load balancer can spread visitors across
+# them) or raise WEB_CONCURRENCY on an instance with more memory.
 workers = int(os.environ.get("WEB_CONCURRENCY", "1"))
-threads = int(os.environ.get("GUNICORN_THREADS", "4"))
+threads = int(os.environ.get("GUNICORN_THREADS", "8"))
 worker_class = "gthread"
 timeout = int(os.environ.get("GUNICORN_TIMEOUT", "120"))
 graceful_timeout = 30
-keepalive = 5
+# Slightly above typical load balancer idle timeouts so reused connections
+# are not closed under the balancer.
+keepalive = int(os.environ.get("GUNICORN_KEEPALIVE", "75"))
 errorlog = "-"
 capture_output = True
 loglevel = "info"
