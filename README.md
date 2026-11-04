@@ -10,7 +10,7 @@ SignEase is a sign language recognition project with a Next.js frontend and a Py
 Predictions blend three models. Two of them read both hands and move and scale each signer to a standard position using their shoulders (see `Ml/training/README.md`). These corrections make webcam recordings match the training data:
 
 - **Frame shape.** The training videos are portrait phone recordings (about 3:4), and MediaPipe coordinates are fractions of the frame's width and height. The browser sends the camera's aspect ratio and the backend re-expresses the landmarks as a 3:4 frame. Without this, a 4:3 webcam squeezes every hand shape to about half its width.
-- **Choosing the signing hand.** The model reads only one hand, the one tracked in more frames. In two-handed signs that is often the still "base" hand, so when both hands are tracked the backend also scores each hand on its own and keeps the most confident result. On the original 120 dictionary videos this fixed 6 predictions and broke none (two-handed signs 33% → 48% correct, all signs 57% → 62%), and the same held on the 127 videos added later, which it was not tuned on (46% → 50%, 6 fixed, none broken).
+- **Choosing the signing hand.** Each model mainly follows one hand, and in two-handed signs or with a resting hand in view it can follow the wrong one, so when both hands are tracked the backend also scores each hand on its own and keeps the most confident result. On the original 120 dictionary videos this fixed 6 predictions and broke none (two-handed signs 33% → 48% correct, all signs 57% → 62%), and the same held on the 127 videos added later, which it was not tuned on (46% → 50%, 6 fixed, none broken).
 - **Calibrated confidence.** The model was trained with smoothed labels, so its raw scores rarely pass about 75% even when it is right. The backend applies temperature scaling (fitted on the 120 dictionary videos) so the confidence shown matches how often predictions are actually correct.
 3. If the device cannot run hand tracking fast enough (no WebGL2, very slow GPU), the page falls back to uploading the recorded clip to `POST /predict`, and the server extracts landmarks itself. This is slower on a shared CPU.
 
@@ -108,7 +108,7 @@ The ML code is based on isolated ASL recognition using the Google ASL Signs data
 
 The model recognizes common ASL concepts such as `hello`, `thankyou`, `mom`, `dad`, `water`, `food`, `book`, `yes`, `no`, `please`, and many more from the 250-sign dataset.
 
-The shipped `asl_model.tflite` is the original Kaggle-notebook transformer, rebuilt from its weights and fine-tuned to be robust to webcam recordings (aspect ratio, framing, raising and lowering the hands). On the 120 dictionary videos, which no model was trained on, it gets 60% top-1 and 68% top-3 through the backend pipeline. See `Ml/training/README.md` for how it was verified, trained, evaluated and calibrated, and how to reproduce it.
+The backend blends three models rebuilt from the original Kaggle-notebook transformer: two read both hands and normalise the signer's position, and one is the earlier fine-tuned one-hand model. On the 250 dictionary videos, which no model was trained on, the blend gets 61% top-1 and 74% top-3 through the backend pipeline. See `Ml/training/README.md` for how they were verified, trained, evaluated and calibrated, and how to reproduce them.
 
 ## Development Notes
 
