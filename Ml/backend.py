@@ -146,10 +146,10 @@ DEFAULT_CAMERA_ASPECT_RATIO = 4 / 3
 # The model is underconfident (it was trained with 0.25 label smoothing), so
 # confidence is temperature-scaled to match how often predictions are right
 # on real sign videos; it never changes the ranking. Fitted for the current
-# model on the 120 dictionary videos (10-fold cross-validated calibration
-# error 0.07, bootstrap 90% interval 0.83-0.94). Refit it with
+# model on the 250 dictionary videos (10-fold cross-validated calibration
+# error 0.08, bootstrap 90% interval 0.87-0.96). Refit it with
 # training/calibrate.py whenever the model changes.
-CONFIDENCE_TEMPERATURE = env_float("CONFIDENCE_TEMPERATURE", 0.89, 0.1, 1.0)
+CONFIDENCE_TEMPERATURE = env_float("CONFIDENCE_TEMPERATURE", 0.92, 0.1, 1.0)
 
 # Landmark uploads: ~30 fps for the 10 second maximum recording, with headroom.
 MAX_LANDMARK_FRAMES = env_int("MAX_LANDMARK_FRAMES", 600)

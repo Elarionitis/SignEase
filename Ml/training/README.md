@@ -69,6 +69,62 @@ cross-validated ECE 0.07). For the old model the same procedure gives 0.76,
 matching the previous value. With 0.89, predictions shown at >= 90% were
 right 96% of the time on the dictionary videos.
 
+## Two-hand model (current)
+
+Three mismatches between the training clips and webcams were measured:
+
+- 147 of 150 random training clips show essentially one tracked hand, while
+  webcams usually also see the resting hand at the signer's side. Counting
+  tracked frames then often chooses the still hand.
+- The model discards the second hand entirely.
+- It reads absolute frame positions, and dictionary signers sit higher
+  (shoulders at 0.51 vs 0.64 of the frame) and appear 20% smaller.
+
+`two_hand.py` adds an embedding of the other hand and arm (starting at zero,
+so the untrained model equals the one it starts from), moves and scales every
+clip to the training median using the shoulders, chooses the dominant hand by
+wrist motion, and adds a synthetic resting hand to 35% of one-handed clips in
+training. Trained from the original weights for 6 + 6 + 8 epochs in stages.
+
+The dictionary videos were split by label: even labels chose between models,
+odd labels were scored once after the choice (`compare.py --final`).
+
+| Test set | Previous model | Two-hand model |
+| --- | --- | --- |
+| Test videos (125), top-1 | 59.2% | **62.4%** |
+| Test videos, top-3 | 68.8% | **74.4%** |
+| Test videos with two tracked hands (44), top-1 | 52.3% | 54.5% |
+| Test videos with hands below the shoulders (65), top-1 | 47.7% | 50.8% |
+| All 250 videos, top-1 (dev half was used to choose) | 55.6% | 59.2% |
+| Held-out signers, webcam simulation, top-1 | **93.7%** | 90.4% |
+| Held-out signers, clean clips, top-1 | **99.0%** | 95.8% |
+
+The dictionary gain is not statistically significant (test videos: 6 fixed,
+2 broken, p=0.29; all 250: 18 fixed, 9 broken, p=0.12), and the model is
+about 3 points worse on the held-out signers, so this is a trade-off, not a
+clear win. Top-3 improved most. Real webcam recordings are needed to settle
+it. The held-out figures are optimistic for both models (the starting weights
+were trained on those signers) and their simulation has no resting hand.
+
+Removing a hand at inference still helps: without the backend's per-hand
+variants the model scores 49.6% instead of 56.0% on the dev videos.
+
+Confidence: `CONFIDENCE_TEMPERATURE = 0.92` (bootstrap 90% interval
+0.87-0.96, 10-fold cross-validated ECE 0.08), fitted on all 250 videos.
+
+```bash
+python finetune.py --two-hand --init original.tflite --cache cache --out runs/b --epochs 6
+python finetune.py --two-hand --init original.tflite --resume runs/b/best.npz \
+    --cache cache --out runs/c --epochs 6 --learning-rate 8e-5
+python finetune.py --two-hand --init original.tflite --resume runs/c/epoch6.npz \
+    --cache cache --out runs/d --epochs 8 --learning-rate 6e-5
+python export.py --weights runs/d/epoch8.npz --out ../ML_Code_ISL/models/asl_model.tflite
+```
+
+Use the last epoch, not `best.npz`: `best.npz` follows the webcam simulation,
+which has no resting hand, so it keeps the starting weights when resuming.
+(Stage b above ran before the motion rule and resting hand were added.)
+
 ## Fine-tuning setup
 
 `finetune.py` starts from the exact original weights and trains 6 epochs on

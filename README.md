@@ -7,7 +7,7 @@ SignEase is a sign language recognition project with a Next.js frontend and a Py
 1. While the user signs, the browser runs **MediaPipe Holistic on every camera frame** (WebAssembly + WebGL, self-hosted from `ISLRv6/public/mediapipe/`). Each frame becomes the 543 face/hand/pose landmarks the model was trained on.
 2. The frames and their timestamps are uploaded as a small binary tensor to `POST /predict-landmarks`. The backend resamples them to the 30 fps the model was trained on, finds the part of the recording where the sign happens (leaving out raising, holding and lowering the hands), and runs the TensorFlow Lite classifier.
 
-Three corrections make webcam recordings match the training data:
+The current model also reads both hands and moves and scales each signer to a standard position using their shoulders (see `Ml/training/README.md`). These corrections make webcam recordings match the training data:
 
 - **Frame shape.** The training videos are portrait phone recordings (about 3:4), and MediaPipe coordinates are fractions of the frame's width and height. The browser sends the camera's aspect ratio and the backend re-expresses the landmarks as a 3:4 frame. Without this, a 4:3 webcam squeezes every hand shape to about half its width.
 - **Choosing the signing hand.** The model reads only one hand, the one tracked in more frames. In two-handed signs that is often the still "base" hand, so when both hands are tracked the backend also scores each hand on its own and keeps the most confident result. On the original 120 dictionary videos this fixed 6 predictions and broke none (two-handed signs 33% → 48% correct, all signs 57% → 62%), and the same held on the 127 videos added later, which it was not tuned on (46% → 50%, 6 fixed, none broken).
@@ -70,7 +70,7 @@ Optional backend environment variables:
 | --- | --- | --- |
 | `CORS_ORIGINS` | `*` | Comma-separated allowed origins, e.g. `https://your-app.vercel.app` |
 | `MAX_LANDMARK_FRAMES` | `600` | Longest landmark sequence accepted |
-| `CONFIDENCE_TEMPERATURE` | `0.89` | Confidence calibration (lower = sharper); `1` shows raw model scores |
+| `CONFIDENCE_TEMPERATURE` | `0.92` | Confidence calibration (lower = sharper); `1` shows raw model scores |
 | `INFERENCE_PASSES` | `1` | Model runs averaged for the chosen segment (only useful for models exported before the fine-tuned one, which dropped frames at random) |
 | `FRAME_SAMPLE_RATE` / `MAX_SAMPLED_FRAMES` | `2` / `48` | Video fallback: frame stride and cap |
 | `MAX_UPLOAD_MB` | `8` | Request size limit |

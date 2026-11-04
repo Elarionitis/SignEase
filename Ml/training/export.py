@@ -15,6 +15,7 @@ import os
 import numpy as np
 
 from model import SignModel, export_tflite
+from two_hand import TwoHandModel
 
 
 def main():
@@ -27,7 +28,8 @@ def main():
     norm = {name[len("norm__"):]: value for name, value in arrays.items() if name.startswith("norm__")}
     weights = {name: value for name, value in arrays.items() if not name.startswith("norm__")}
     tmp = args.out + ".tmp"
-    export_tflite(SignModel(weights, norm), tmp)
+    model_class = TwoHandModel if "other_w1" in weights else SignModel
+    export_tflite(model_class(weights, norm), tmp)
     os.replace(tmp, args.out)
     print(f"wrote {args.out} ({os.path.getsize(args.out) / 1e6:.1f} MB)")
 

@@ -157,10 +157,15 @@ def preprocess_cached(frames):
     if not left_dominant:
         data[:, MIRROR_X, 0] = 1.0 - data[:, MIRROR_X, 0]
     idxs = (keep - keep.min()).astype(np.float32)
-    n = len(data)
+    return fit_cached(data, idxs, n_frames0)
+
+
+def fit_cached(data, idxs, n_frames0):
+    """Pads or pools selected frames [n, cols, 2] to 64 frames."""
+    n, n_cols = data.shape[:2]
 
     if n < INPUT_SIZE:
-        data = np.concatenate([data, np.zeros((INPUT_SIZE - n, N_COLS, 2), np.float32)])
+        data = np.concatenate([data, np.zeros((INPUT_SIZE - n, n_cols, 2), np.float32)])
         idxs = np.concatenate([idxs, np.full(INPUT_SIZE - n, -1, np.float32)])
         return np.nan_to_num(data, nan=0.0).astype(np.float32), idxs
 
@@ -175,7 +180,7 @@ def preprocess_cached(frames):
     pad_right = pad_left + (1 if pad % 2 else 0)
     data = np.concatenate([np.repeat(data[:1], pad_left, 0), data, np.repeat(data[-1:], pad_right, 0)])
     idxs = np.concatenate([np.repeat(idxs[:1], pad_left), idxs, np.repeat(idxs[-1:], pad_right)])
-    data = data.reshape(INPUT_SIZE, -1, N_COLS, 2)
+    data = data.reshape(INPUT_SIZE, -1, n_cols, 2)
     idxs = idxs.reshape(INPUT_SIZE, -1)
     with np.errstate(invalid="ignore"):
         counts = (~np.isnan(data)).sum(axis=1)
@@ -205,6 +210,11 @@ def preprocess_tf(frames):
     ], axis=1)
     data = tf.where(left_dominant, tf.gather(selected, LEFT_DOMINANT_ROWS, axis=1), mirrored)
     idxs = tf.cast(keep - tf.reduce_min(keep), tf.float32)
+    return fit_tf(data, idxs, n_frames0, N_COLS)
+
+
+def fit_tf(data, idxs, n_frames0, n_cols):
+    """TF version of fit_cached."""
     n = tf.shape(data)[0]
 
     def pad_short():
@@ -225,7 +235,7 @@ def preprocess_tf(frames):
         pad_right = pad_left + pad % 2
         d = tf.concat([tf.repeat(d[:1], pad_left, axis=0), d, tf.repeat(d[-1:], pad_right, axis=0)], axis=0)
         i = tf.concat([tf.repeat(i[:1], pad_left), i, tf.repeat(i[-1:], pad_right)], axis=0)
-        d = tf.reshape(d, [INPUT_SIZE, -1, N_COLS, 2])
+        d = tf.reshape(d, [INPUT_SIZE, -1, n_cols, 2])
         i = tf.reshape(i, [INPUT_SIZE, -1])
         valid = ~tf.math.is_nan(d)
         counts = tf.reduce_sum(tf.cast(valid, tf.float32), axis=1)
@@ -234,13 +244,15 @@ def preprocess_tf(frames):
         return d, tf.reduce_mean(i, axis=1)
 
     data, idxs = tf.cond(n < INPUT_SIZE, pad_short, pool_long)
-    return tf.reshape(data, [INPUT_SIZE, N_COLS, 2]), tf.reshape(idxs, [INPUT_SIZE])
+    return tf.reshape(data, [INPUT_SIZE, n_cols, 2]), tf.reshape(idxs, [INPUT_SIZE])
 
 
 # ------------------------------------------------------------------ model
 
 
 class SignModel(tf.Module):
+    preprocess = staticmethod(preprocess_tf)
+
     def __init__(self, weights, norm):
         super().__init__()
         self.w = {k: tf.Variable(v, name=k) for k, v in weights.items()}
@@ -254,14 +266,17 @@ class SignModel(tf.Module):
         empty = tf.equal(tf.reduce_sum(x, axis=2, keepdims=True), 0.0)
         return tf.where(empty, self.w[f"{part}_empty"], dense)
 
-    def __call__(self, data, idxs, training=False, dropout=0.0):
-        """data [B, 64, 66, 2], idxs [B, 64] -> logits [B, 250]."""
+    def _embed(self, data):
         parts = tf.stack([
             self._embed_part(data[:, :, 0:40], "lips"),
             self._embed_part(data[:, :, 40:61], "hand"),
             self._embed_part(data[:, :, 61:66], "pose"),
         ], axis=3)
-        x = tf.reduce_sum(parts * tf.nn.softmax(self.w["landmark_logits"]), axis=3)
+        return tf.reduce_sum(parts * tf.nn.softmax(self.w["landmark_logits"]), axis=3)
+
+    def __call__(self, data, idxs, training=False, dropout=0.0):
+        """data [B, 64, cols, 2], idxs [B, 64] -> logits [B, 250]."""
+        x = self._embed(data)
         x = tf.nn.gelu(x @ self.w["fc_w1"]) @ self.w["fc_w2"]
 
         max_idx = tf.clip_by_value(tf.reduce_max(idxs, axis=1, keepdims=True), 1.0, np.inf)
@@ -308,7 +323,7 @@ def export_tflite(model, path):
 
     @tf.function(input_signature=[tf.TensorSpec([None, 543, 3], tf.float32, name="inputs")])
     def serve(inputs):
-        data, idxs = preprocess_tf(inputs)
+        data, idxs = model.preprocess(inputs)
         probabilities = tf.nn.softmax(model(data[None], idxs[None]))
         return {"outputs": tf.reshape(probabilities, [NUM_CLASSES])}
 

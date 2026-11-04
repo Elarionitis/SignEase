@@ -28,19 +28,20 @@ from augment import train_transform, webcam
 from batching import Preprocessor
 from data import HOLDOUT_PARTICIPANTS, load_cache
 from model import NUM_CLASSES, SignModel, load_tflite_weights, preprocess_cached
+from two_hand import N_COLS_TWO_HAND, TwoHandModel, add_other_hand, preprocess_two_hand, preprocess_two_hand_train
 
 ORIGINAL_MODEL = os.path.join(os.path.dirname(__file__), "..", "ML_Code_ISL", "models", "asl_model.tflite")
 
 
-def holdout_batches(frames, offsets, meta, count, seed=99):
+def holdout_batches(frames, offsets, meta, count, seed=99, preprocess=preprocess_cached):
     """Fixed clean and webcam-like holdout sets (model-level, for monitoring)."""
     holdout = meta[meta["participant_id"].isin(HOLDOUT_PARTICIPANTS)]
     picks = np.random.default_rng(seed).choice(holdout.index.to_numpy(), count, replace=False)
     sets = {"clean": [], "webcam": []}
     for index in picks:
         sample = np.asarray(frames[offsets[index]:offsets[index + 1]])
-        sets["clean"].append(preprocess_cached(sample))
-        sets["webcam"].append(preprocess_cached(webcam(sample, np.random.default_rng((seed, int(index))))))
+        sets["clean"].append(preprocess(sample))
+        sets["webcam"].append(preprocess(webcam(sample, np.random.default_rng((seed, int(index))))))
     labels = meta.loc[picks, "label"].to_numpy()
     out = {}
     for name, items in sets.items():
@@ -70,6 +71,8 @@ def main():
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--label-smoothing", type=float, default=0.25)
     parser.add_argument("--limit", type=int, default=0, help="train on N clips per epoch (for testing)")
+    parser.add_argument("--two-hand", action="store_true", help="also feed the model the other hand and arm")
+    parser.add_argument("--resume", help="continue from a two-hand best.npz instead of --init")
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
     os.makedirs(args.out, exist_ok=True)
@@ -80,10 +83,19 @@ def main():
     frames, offsets, meta = load_cache(args.cache)
     train_index = meta.index[~meta["participant_id"].isin(HOLDOUT_PARTICIPANTS)].to_numpy()
     labels = meta["label"].to_numpy()
-    monitor = holdout_batches(frames, offsets, meta, 3000)
+    preprocess = preprocess_two_hand if args.two_hand else preprocess_cached
+    monitor = holdout_batches(frames, offsets, meta, 3000, preprocess=preprocess)
 
     weights, norm = load_tflite_weights(args.init)
-    model = SignModel(weights, norm)
+    if args.two_hand:
+        samples = np.random.default_rng(args.seed).choice(train_index, 2000, replace=False)
+        clips = [preprocess(np.asarray(frames[offsets[i]:offsets[i + 1]]))[0] for i in samples]
+        weights, norm = add_other_hand(weights, norm, np.stack(clips), args.seed)
+    if args.resume:
+        arrays = dict(np.load(args.resume))
+        norm = {name[len("norm__"):]: value for name, value in arrays.items() if name.startswith("norm__")}
+        weights = {name: value for name, value in arrays.items() if not name.startswith("norm__")}
+    model = (TwoHandModel if args.two_hand else SignModel)(weights, norm)
     variables = list(model.w.values())
 
     per_epoch = args.limit or len(train_index)
@@ -93,7 +105,8 @@ def main():
     )
     optimizer = tf.keras.optimizers.AdamW(learning_rate=schedule, weight_decay=args.weight_decay, clipnorm=1.0)
     loss_fn = tf.keras.losses.CategoricalCrossentropy(from_logits=True, label_smoothing=args.label_smoothing)
-    spec = [tf.TensorSpec([None, 64, 66, 2], tf.float32), tf.TensorSpec([None, 64], tf.float32), tf.TensorSpec([None], tf.int32)]
+    n_cols = N_COLS_TWO_HAND if args.two_hand else 66
+    spec = [tf.TensorSpec([None, 64, n_cols, 2], tf.float32), tf.TensorSpec([None, 64], tf.float32), tf.TensorSpec([None], tf.int32)]
 
     @tf.function(input_signature=spec)
     def train_step(data, idxs, y):
@@ -123,7 +136,8 @@ def main():
     best = history[-1]["webcam"]
     save_weights(model, os.path.join(args.out, "best.npz"))
 
-    preprocessor = Preprocessor(args.cache, transform=train_transform, seed=args.seed)
+    extra = {"preprocess": preprocess_two_hand_train} if args.two_hand else {}
+    preprocessor = Preprocessor(args.cache, transform=train_transform, seed=args.seed, **extra)
     rng = np.random.default_rng(args.seed)
     try:
         for epoch in range(1, args.epochs + 1):
