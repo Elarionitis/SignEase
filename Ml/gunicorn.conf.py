@@ -2,7 +2,7 @@ import os
 
 bind = f"0.0.0.0:{os.environ.get('PORT', '5000')}"
 # One worker keeps the model in memory once on the small Render instance.
-# Inside it, INFERENCE_WORKERS interpreters (backend.py) run predictions in
+# Inside it, INFERENCE_WORKERS sets of models (backend.py) run predictions in
 # parallel and the extra threads keep /health and /warmup answering while
 # they run. Requests beyond the backend's queue limits get a fast 503 with
 # Retry-After, which the browser retries. To scale out, add instances (the

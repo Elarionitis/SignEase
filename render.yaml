@@ -19,7 +19,11 @@ services:
         value: 3.11.11
       - key: CORS_ORIGINS
         sync: false
+      # One set of the blended models fits 512 MB. On a larger plan, raise
+      # this and set MEMORY_LIMIT_MB to the plan's memory.
       - key: INFERENCE_WORKERS
-        value: "2"
+        value: "1"
+      - key: MEMORY_LIMIT_MB
+        value: "512"
       - key: GUNICORN_THREADS
         value: "8"

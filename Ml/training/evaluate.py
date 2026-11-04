@@ -31,12 +31,12 @@ from landmarks import expand_cached  # noqa: E402
 
 
 def use_model(path, passes):
-    # The backend borrows interpreters from a pool; give it exactly one.
-    backend.TFLITE_MODEL_PATH = path
-    runner = backend.create_runner(backend.import_interpreter())
+    # The backend borrows sets of interpreters from a pool; give it exactly
+    # one set, holding just this model.
+    runner = backend.create_runner(backend.import_interpreter(), path)
     while not backend.interpreter_pool.empty():
         backend.interpreter_pool.get_nowait()
-    backend.interpreter_pool.put(runner)
+    backend.interpreter_pool.put([(runner, 1.0)])
     backend.prediction_fn = runner
     backend.ORD2SIGN = backend.load_labels()
     backend.INFERENCE_PASSES = passes

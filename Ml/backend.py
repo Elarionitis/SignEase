@@ -16,6 +16,8 @@ import json
 import logging
 import os
 import queue
+import resource
+import sys
 import threading
 import time
 import warnings
@@ -87,7 +89,13 @@ ML_DIR = os.path.join(BASE_DIR, "ML_Code_ISL")
 UPLOAD_FOLDER = os.path.join(BASE_DIR, "saved_videos")
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-TFLITE_MODEL_PATH = os.path.join(ML_DIR, "models", "asl_model.tflite")
+# Predictions blend models that make different mistakes (see
+# training/README.md), each with its share of the final score.
+MODEL_BLEND = (
+    (os.path.join(ML_DIR, "models", "asl_model.tflite"), 1 / 3),
+    (os.path.join(ML_DIR, "models", "asl_model_two_hand_b.tflite"), 1 / 3),
+    (os.path.join(ML_DIR, "models", "asl_model_one_hand.tflite"), 1 / 3),
+)
 LABEL_MAP_PATH = os.path.join(ML_DIR, "data", "sign_to_prediction_index_map.json")
 
 ROWS_PER_FRAME = 543
@@ -146,10 +154,10 @@ DEFAULT_CAMERA_ASPECT_RATIO = 4 / 3
 # The model is underconfident (it was trained with 0.25 label smoothing), so
 # confidence is temperature-scaled to match how often predictions are right
 # on real sign videos; it never changes the ranking. Fitted for the current
-# model on the 250 dictionary videos (10-fold cross-validated calibration
-# error 0.08, bootstrap 90% interval 0.87-0.96). Refit it with
+# blend on the 250 dictionary videos (10-fold cross-validated calibration
+# error 0.06, bootstrap 90% interval 0.82-0.90). Refit it with
 # training/calibrate.py whenever the model changes.
-CONFIDENCE_TEMPERATURE = env_float("CONFIDENCE_TEMPERATURE", 0.92, 0.1, 1.0)
+CONFIDENCE_TEMPERATURE = env_float("CONFIDENCE_TEMPERATURE", 0.86, 0.1, 1.0)
 
 # Landmark uploads: ~30 fps for the 10 second maximum recording, with headroom.
 MAX_LANDMARK_FRAMES = env_int("MAX_LANDMARK_FRAMES", 600)
@@ -168,10 +176,15 @@ MAX_VIDEO_FRAME_WIDTH = env_int("MAX_VIDEO_FRAME_WIDTH", 640)
 
 # --- Capacity -------------------------------------------------------------
 # A TFLite interpreter is not thread-safe, so each concurrent prediction
-# needs its own. Each copy costs ~45 MB; two fit Render's 512 MB instance
-# next to the video fallback and let one visitor's prediction run while
-# another's is still scoring.
-INFERENCE_WORKERS = env_int("INFERENCE_WORKERS", 2)
+# needs its own set of the blended models. A set uses ~200 MB once running
+# (measured 249 MB for the whole process with one set, 416 MB with two), so
+# one set fits Render's 512 MB instance. With more memory, raise this.
+INFERENCE_WORKERS = env_int("INFERENCE_WORKERS", 1)
+# The video fallback loads MediaPipe, which measured ~310 MB. If that would
+# not fit, the server refuses the clip: running out of memory would restart
+# the instance and fail every visitor's prediction, not just this one.
+MEMORY_LIMIT_MB = env_int("MEMORY_LIMIT_MB", 512)
+VIDEO_FALLBACK_MB = env_int("VIDEO_FALLBACK_MB", 310)
 # Landmark predictions take well under a second, so a short wait for a free
 # interpreter is better than an error. Beyond this queue depth, answer 503
 # with Retry-After immediately so threads stay free for health checks and the
@@ -333,19 +346,23 @@ def load_model():
         if prediction_fn is not None:
             return
 
-        if not os.path.isfile(TFLITE_MODEL_PATH):
-            raise RuntimeError(f"Missing ML model: {TFLITE_MODEL_PATH}")
+        for path, _ in MODEL_BLEND:
+            if not os.path.isfile(path):
+                raise RuntimeError(f"Missing ML model: {path}")
 
         Interpreter = import_interpreter()
         labels = load_labels()
-        runners = [create_runner(Interpreter) for _ in range(INFERENCE_WORKERS)]
-        for runner in runners:
-            interpreter_pool.put(runner)
+        runners = [
+            [(create_runner(Interpreter, path), weight) for path, weight in MODEL_BLEND]
+            for _ in range(INFERENCE_WORKERS)
+        ]
+        for runner_set in runners:
+            interpreter_pool.put(runner_set)
 
         ORD2SIGN = labels
         # Set last: it marks the model as ready for other threads.
         prediction_fn = runners[0]
-        app.logger.info("Loaded the sign model (%s interpreters)", len(runners))
+        app.logger.info("Loaded %s sign models x %s workers", len(MODEL_BLEND), len(runners))
 
 
 def import_interpreter():
@@ -374,9 +391,9 @@ def import_interpreter():
         ) from error
 
 
-def create_runner(Interpreter):
+def create_runner(Interpreter, path):
     model = Interpreter(
-        model_path=TFLITE_MODEL_PATH,
+        model_path=path,
         num_threads=env_int("TFLITE_NUM_THREADS", 1),
     )
     serving_signature = model.get_signature_list().get("serving_default")
@@ -647,8 +664,8 @@ def parse_landmark_upload(body, frame_count_header, layout_header=None):
 
 
 class pooled_runner:
-    """Borrows an interpreter for one prediction (all its windows), waiting
-    a bounded time for one to free up."""
+    """Borrows one interpreter per blended model for a prediction, waiting a
+    bounded time for a set to free up."""
 
     def __enter__(self):
         try:
@@ -734,10 +751,17 @@ def hand_variants(frames):
 
 
 def score_recording(frames):
-    """Scores every hand variant and keeps the most confident one."""
-    with pooled_runner() as runner:
-        scored = [score_windows(variant, runner) for variant in hand_variants(frames)]
-    return max(scored, key=lambda result: result[0].max())
+    """Each model scores every hand variant and keeps its most confident
+    result; the models' results are then blended by weight."""
+    variants = hand_variants(frames)
+    blended, frames_used = 0.0, None
+    with pooled_runner() as runner_set:
+        for runner, weight in runner_set:
+            scored = [score_windows(variant, runner) for variant in variants]
+            scores, used = max(scored, key=lambda result: result[0].max())
+            blended = blended + weight * scores
+            frames_used = used if frames_used is None else frames_used
+    return blended, frames_used
 
 
 def get_prediction(frames):
@@ -829,10 +853,23 @@ def predict():
         return predict_video(started_at)
 
 
+def peak_memory_mb():
+    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return peak / (1024 * 1024) if sys.platform == "darwin" else peak / 1024
+
+
 def predict_video(started_at):
     file = request.files.get("video")
     if file is None:
         return jsonify({"error": "No video uploaded"}), 400
+
+    if holistic is None and peak_memory_mb() + VIDEO_FALLBACK_MB > MEMORY_LIMIT_MB:
+        app.logger.warning("Refused the video fallback: not enough memory to load MediaPipe")
+        # 501, not 503: retrying would not help.
+        return jsonify({
+            "error": "This device is too slow for live hand tracking. "
+            "Please try a recent laptop or phone with Chrome."
+        }), 501
 
     load_model()
     suffix = Path(file.filename or "").suffix.lower()

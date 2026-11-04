@@ -7,7 +7,7 @@ SignEase is a sign language recognition project with a Next.js frontend and a Py
 1. While the user signs, the browser runs **MediaPipe Holistic on every camera frame** (WebAssembly + WebGL, self-hosted from `ISLRv6/public/mediapipe/`). Each frame becomes the 543 face/hand/pose landmarks the model was trained on.
 2. The frames and their timestamps are uploaded as a small binary tensor to `POST /predict-landmarks`. The backend resamples them to the 30 fps the model was trained on, finds the part of the recording where the sign happens (leaving out raising, holding and lowering the hands), and runs the TensorFlow Lite classifier.
 
-The current model also reads both hands and moves and scales each signer to a standard position using their shoulders (see `Ml/training/README.md`). These corrections make webcam recordings match the training data:
+Predictions blend three models. Two of them read both hands and move and scale each signer to a standard position using their shoulders (see `Ml/training/README.md`). These corrections make webcam recordings match the training data:
 
 - **Frame shape.** The training videos are portrait phone recordings (about 3:4), and MediaPipe coordinates are fractions of the frame's width and height. The browser sends the camera's aspect ratio and the backend re-expresses the landmarks as a 3:4 frame. Without this, a 4:3 webcam squeezes every hand shape to about half its width.
 - **Choosing the signing hand.** The model reads only one hand, the one tracked in more frames. In two-handed signs that is often the still "base" hand, so when both hands are tracked the backend also scores each hand on its own and keeps the most confident result. On the original 120 dictionary videos this fixed 6 predictions and broke none (two-handed signs 33% → 48% correct, all signs 57% → 62%), and the same held on the 127 videos added later, which it was not tuned on (46% → 50%, 6 fixed, none broken).
@@ -70,11 +70,12 @@ Optional backend environment variables:
 | --- | --- | --- |
 | `CORS_ORIGINS` | `*` | Comma-separated allowed origins, e.g. `https://your-app.vercel.app` |
 | `MAX_LANDMARK_FRAMES` | `600` | Longest landmark sequence accepted |
-| `CONFIDENCE_TEMPERATURE` | `0.92` | Confidence calibration (lower = sharper); `1` shows raw model scores |
+| `CONFIDENCE_TEMPERATURE` | `0.86` | Confidence calibration (lower = sharper); `1` shows raw model scores |
 | `INFERENCE_PASSES` | `1` | Model runs averaged for the chosen segment (only useful for models exported before the fine-tuned one, which dropped frames at random) |
 | `FRAME_SAMPLE_RATE` / `MAX_SAMPLED_FRAMES` | `2` / `48` | Video fallback: frame stride and cap |
 | `MAX_UPLOAD_MB` | `8` | Request size limit |
-| `INFERENCE_WORKERS` | `2` | Model copies that predict in parallel (~45 MB each) |
+| `INFERENCE_WORKERS` | `1` | Sets of the three models that predict in parallel (~200 MB per set once running) |
+| `MEMORY_LIMIT_MB` / `VIDEO_FALLBACK_MB` | `512` / `310` | The video fallback is refused if loading it would pass the limit. Set the limit to your plan's memory |
 | `MAX_QUEUED_PREDICTIONS` | `8` | Landmark requests allowed to wait for a free model before the server answers 503 |
 | `PREDICTION_QUEUE_TIMEOUT_SECONDS` | `15` | Longest wait for a free model |
 | `MAX_QUEUED_VIDEO_PREDICTIONS` | `2` | Video-fallback requests allowed to wait (one runs at a time) |
@@ -86,7 +87,8 @@ Optional backend environment variables:
 
 The backend is built to stay responsive when many people try the demo at once:
 
-- **Parallel predictions.** `INFERENCE_WORKERS` copies of the model take requests at the same time. With two copies, a load test of 20 concurrent visitors ran at twice the throughput of one copy (33 vs 17 predictions/s on a multi-core machine) with half the latency. On a shared Render CPU the absolute numbers are lower.
+- **Capacity.** One set of the three models fits a 512 MB instance. A load test with 60 concurrent visitors had no failures on an Apple M5 (116 predictions/s, short clip); a shared Render CPU is much slower. With more memory, raise `INFERENCE_WORKERS` so predictions run in parallel.
+- **Memory guard.** The video fallback needs about 310 MB more, which does not fit next to the models on 512 MB, so slow devices get a clear message there instead of the server restarting. On a 2 GB plan, set `MEMORY_LIMIT_MB=2048` to enable it.
 - **Small uploads.** The browser uploads only the 94 landmark rows the model reads (`X-Landmark-Layout: compact-v1`), about 6x less data than full frames, with identical predictions. The server still accepts full frames from older clients.
 - **Backpressure instead of timeouts.** When every model copy is busy and the queue is full, the server answers `503` with `Retry-After` straight away instead of holding the connection. The video fallback (MediaPipe on the server, seconds per clip) has its own small queue, so it cannot use up the threads the fast landmark path needs.
 - **Automatic retries.** The page retries `429`/`502`/`503`/`504` responses and network failures up to 4 times, with jittered backoff and `Retry-After` honoured, and tells the user it is retrying.
