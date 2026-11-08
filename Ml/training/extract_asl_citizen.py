@@ -1,9 +1,9 @@
 """Extracts SignEase landmarks from ASL Citizen videos in a zip.
 
-The same code the Colab notebook runs (colab/asl_citizen_landmarks.ipynb,
-step 5), with the same MediaPipe version and Holistic settings as SignEase.
-<dir> must hold manifest.csv (from the notebook); chunk_*.npz files are
-written there and finished ones are skipped on a rerun:
+Uses the same MediaPipe version (0.10.14) and Holistic settings as SignEase.
+<dir> must hold manifest.csv (columns video, member, order, priority, plus
+signease_sign/gloss/participant/split for asl_citizen.py); chunk_*.npz files
+are written there and finished ones are skipped on a rerun:
 
     python extract_asl_citizen.py <videos.zip> <dir> ours 400 640
 """
@@ -78,7 +78,8 @@ def main():
             if os.path.exists(out):
                 continue
             results = list(pool.imap(extract, [r["member"] for r in c], chunksize=2))
-            local = os.path.join(work_dir, os.path.basename(out))
+            # A different name, so this works when the output folder is work_dir.
+            local = os.path.join(work_dir, "writing_" + os.path.basename(out))
             np.savez_compressed(
                 local, video=np.array([os.path.basename(r[0]) for r in results]),
                 order=np.array([int(r["order"]) for r in c]), lengths=np.array([len(r[1]) for r in results]),

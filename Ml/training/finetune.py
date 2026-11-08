@@ -86,6 +86,9 @@ def main():
         "--hand-size", type=lambda text: tuple(float(v) for v in text.split(",")), default=None,
         help=f"smallest,largest hand scale (two-hand default {HAND_SIZE_LIMITS}; one-hand default: unchanged)",
     )
+    parser.add_argument(
+        "--monitor-cache", help="cache scored after every epoch (e.g. ASL Citizen val signers); picks best.npz"
+    )
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
     os.makedirs(args.out, exist_ok=True)
@@ -98,6 +101,13 @@ def main():
     labels = meta["label"].to_numpy()
     preprocess = preprocess_two_hand if args.two_hand else preprocess_cached
     monitor = holdout_batches(frames, offsets, meta, 3000, preprocess=preprocess)
+    if args.monitor_cache:
+        extra_frames, extra_offsets, extra_meta = load_cache(args.monitor_cache)
+        items = [preprocess(np.asarray(extra_frames[extra_offsets[i]:extra_offsets[i + 1]])) for i in range(len(extra_meta))]
+        data, idxs = np.stack([d for d, _ in items]), np.stack([i for _, i in items])
+        valid = (idxs != -1).any(axis=1)
+        monitor["monitor"] = (data[valid], idxs[valid], extra_meta["label"].to_numpy()[valid])
+    best_key = "monitor" if args.monitor_cache else "webcam"
 
     weights, norm = load_tflite_weights(args.init)
     if args.two_hand:
@@ -146,7 +156,7 @@ def main():
 
     history = [{"epoch": 0, **evaluate()}]
     print("before fine-tuning:", history[-1], flush=True)
-    best = history[-1]["webcam"]
+    best = history[-1][best_key]
     save_weights(model, os.path.join(args.out, "best.npz"))
 
     transform, extra = train_transform, {}
@@ -175,8 +185,8 @@ def main():
             history.append({"epoch": epoch, "train_loss": float(np.mean(losses)), "train_acc": float(np.mean(accuracies)), **scores})
             print(f"epoch {epoch}: {history[-1]} ({time.time() - started:.0f}s)", flush=True)
             save_weights(model, os.path.join(args.out, f"epoch{epoch}.npz"))
-            if scores["webcam"] > best:
-                best = scores["webcam"]
+            if scores[best_key] > best:
+                best = scores[best_key]
                 save_weights(model, os.path.join(args.out, "best.npz"))
             with open(os.path.join(args.out, "history.json"), "w") as file:
                 json.dump(history, file, indent=2)
