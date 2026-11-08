@@ -91,11 +91,23 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 # Predictions blend models that make different mistakes (see
 # training/README.md), each with its share of the final score.
-MODEL_BLEND = (
+DEFAULT_MODEL_BLEND = (
     (os.path.join(ML_DIR, "models", "asl_model.tflite"), 1 / 3),
     (os.path.join(ML_DIR, "models", "asl_model_two_hand_b.tflite"), 1 / 3),
     (os.path.join(ML_DIR, "models", "asl_model_one_hand.tflite"), 1 / 3),
 )
+
+
+def model_blend():
+    """MODEL_PATHS (comma-separated .tflite paths, equal weights) replaces the
+    default blend, e.g. to try candidate models locally."""
+    paths = [path.strip() for path in os.environ.get("MODEL_PATHS", "").split(",") if path.strip()]
+    if not paths:
+        return DEFAULT_MODEL_BLEND
+    return tuple((os.path.abspath(path), 1 / len(paths)) for path in paths)
+
+
+MODEL_BLEND = model_blend()
 LABEL_MAP_PATH = os.path.join(ML_DIR, "data", "sign_to_prediction_index_map.json")
 
 ROWS_PER_FRAME = 543

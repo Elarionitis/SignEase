@@ -17,6 +17,7 @@ file has been replaced, get the original from git history:
 """
 
 import argparse
+import functools
 import json
 import os
 import time
@@ -28,7 +29,15 @@ from augment import train_transform, webcam
 from batching import Preprocessor
 from data import HOLDOUT_PARTICIPANTS, load_cache
 from model import NUM_CLASSES, SignModel, load_tflite_weights, preprocess_cached
-from two_hand import N_COLS_TWO_HAND, TwoHandModel, add_other_hand, preprocess_two_hand, preprocess_two_hand_train
+from two_hand import (
+    HAND_SIZE_LIMITS,
+    N_COLS_TWO_HAND,
+    TwoHandModel,
+    add_other_hand,
+    preprocess_two_hand,
+    preprocess_two_hand_train,
+    train_transform_hand_size,
+)
 
 ORIGINAL_MODEL = os.path.join(os.path.dirname(__file__), "..", "ML_Code_ISL", "models", "asl_model.tflite")
 
@@ -73,6 +82,10 @@ def main():
     parser.add_argument("--limit", type=int, default=0, help="train on N clips per epoch (for testing)")
     parser.add_argument("--two-hand", action="store_true", help="also feed the model the other hand and arm")
     parser.add_argument("--resume", help="continue from a two-hand best.npz instead of --init")
+    parser.add_argument(
+        "--hand-size", type=lambda text: tuple(float(v) for v in text.split(",")), default=None,
+        help=f"smallest,largest hand scale (two-hand default {HAND_SIZE_LIMITS}; one-hand default: unchanged)",
+    )
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
     os.makedirs(args.out, exist_ok=True)
@@ -136,8 +149,12 @@ def main():
     best = history[-1]["webcam"]
     save_weights(model, os.path.join(args.out, "best.npz"))
 
-    extra = {"preprocess": preprocess_two_hand_train} if args.two_hand else {}
-    preprocessor = Preprocessor(args.cache, transform=train_transform, seed=args.seed, **extra)
+    transform, extra = train_transform, {}
+    if args.two_hand:
+        extra["preprocess"] = functools.partial(preprocess_two_hand_train, hand_size=args.hand_size or HAND_SIZE_LIMITS)
+    elif args.hand_size:
+        transform = functools.partial(train_transform_hand_size, hand_size=args.hand_size)
+    preprocessor = Preprocessor(args.cache, transform=transform, seed=args.seed, **extra)
     rng = np.random.default_rng(args.seed)
     try:
         for epoch in range(1, args.epochs + 1):

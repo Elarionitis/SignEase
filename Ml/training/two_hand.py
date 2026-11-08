@@ -61,8 +61,10 @@ BOTH_TRACKED_RATIO = 0.5
 RESTING_HAND_RATE = 0.35
 RESTING_HAND_MAX_TRACKED = 0.1
 SWAP_MIN_MOTION_RATIO = 0.5
-# Training: people's hands differ in size relative to their shoulders.
-HAND_SIZE_RANGE = 0.2
+# Training: hand size relative to the shoulders, as (smallest, largest)
+# scale. People's proportions differ, and a webcam further away than a
+# hand-held phone shows the hands smaller (finetune.py --hand-size).
+HAND_SIZE_LIMITS = (float(np.exp(-0.2)), float(np.exp(0.2)))
 
 # Median shoulder centre and width of the training clips (3:4 frame).
 TARGET_CENTER = np.array([0.5, 0.644], np.float32)
@@ -123,9 +125,10 @@ def add_resting_hand(frames, rng):
     return out
 
 
-def vary_hand_size(frames, rng):
-    """Scales both hands about their wrists, as for a signer with other proportions."""
-    factor = np.float32(np.exp(rng.uniform(-HAND_SIZE_RANGE, HAND_SIZE_RANGE)))
+def vary_hand_size(frames, rng, limits=HAND_SIZE_LIMITS):
+    """Scales both hands about their wrists, as for a signer with other
+    proportions or a camera further away."""
+    factor = np.float32(np.exp(rng.uniform(np.log(limits[0]), np.log(limits[1]))))
     out = frames.copy()
     for hand in (_CACHE_LEFT_HAND, _CACHE_RIGHT_HAND):
         wrist = out[:, hand[:1]]
@@ -168,10 +171,17 @@ def preprocess_two_hand(frames, swap=False, hide_other=False, rng=None):
     return fit_cached(data, (keep - keep.min()).astype(np.float32), len(frames))
 
 
-def preprocess_two_hand_train(frames, rng):
+def train_transform_hand_size(frames, rng, hand_size):
+    """One-hand training: the usual augmentation, after varying hand size."""
+    from augment import train_transform
+
+    return train_transform(vary_hand_size(frames, rng, hand_size), rng)
+
+
+def preprocess_two_hand_train(frames, rng, hand_size=HAND_SIZE_LIMITS):
     if rng.random() < RESTING_HAND_RATE:
         frames = add_resting_hand(frames, rng)
-    frames = vary_hand_size(frames, rng)
+    frames = vary_hand_size(frames, rng, hand_size)
     _, motions, both = choose_dominant(frames)
     comparable = both and min(motions) >= SWAP_MIN_MOTION_RATIO * max(motions) and max(motions) > 0
     swap = comparable and rng.random() < SWAP_RATE
