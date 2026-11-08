@@ -58,6 +58,15 @@ const DEFAULT_RECORDING_DURATION = 5;
 // of signing, ends the recording.
 const AUTO_STOP_HANDS_GONE_MS = 700;
 const AUTO_STOP_MIN_HAND_FRAMES = 12;
+// Auto-stop also when the hands are lowered but stay in view (webcams see the
+// lap; the phone videos the model learned from did not): every visible hand
+// below the training frame's bottom edge and still for this long.
+const AUTO_STOP_RESTING_MS = 600;
+const RESTING_MAX_MOVEMENT = 0.04;
+// Practice: count a near-tie with a look-alike sign (e.g. yes / can) as a
+// match when the target is the runner-up with at least this share of the top
+// score.
+const PRACTICE_NEAR_TIE = 0.6;
 // Live hand preview and framing check between recordings.
 const PREVIEW_INTERVAL_MS = 180;
 const COUNTDOWN_PREVIEW_INTERVAL_MS = 60;
@@ -184,6 +193,8 @@ interface RecognitionResult {
   confidence: number;
   alternatives: SignPrediction[];
   mode: PredictionMode;
+  /** Practice: the target was a near-tie runner-up and is shown first. */
+  nearTie?: boolean;
 }
 
 type FramingIssue = "no-person" | "too-close" | "too-low" | "too-far" | "off-center" | null;
@@ -228,6 +239,59 @@ function analyzeFraming(values: Float32Array, aspect: number): FramingIssue {
   return null;
 }
 
+// Signer-relative position, as in the training videos (Ml/backend.py and
+// Ml/training/two_hand.py): shoulders 0.644 down a 3:4 frame, 0.562 wide.
+// There, 99.9% of tracked wrists were above 1.07 and the frame ended at 1.0.
+const TRAINING_ASPECT = 3 / 4;
+const TRAINING_SHOULDER_Y = 0.644;
+const TRAINING_SHOULDER_WIDTH = 0.562;
+const TRAINING_FRAME_BOTTOM = 1.0;
+const LEFT_WRIST_ROW = 468;
+const RIGHT_WRIST_ROW = 522;
+
+/** Wrist heights of the visible hands on the training scale, or null without shoulders. */
+function wristHeights(values: Float32Array, aspect: number): number[] | null {
+  const x = (index: number) => 0.5 + (values[(POSE_ROW + index) * 3] - 0.5) * (aspect / TRAINING_ASPECT);
+  const y = (index: number) => values[(POSE_ROW + index) * 3 + 1];
+  const width = Math.abs(x(11) - x(12));
+  if (!Number.isFinite(width) || width < 0.02) return null;
+  const scale = Math.min(1.7, Math.max(0.6, TRAINING_SHOULDER_WIDTH / width));
+  const shoulderY = (y(11) + y(12)) / 2;
+  return [LEFT_WRIST_ROW, RIGHT_WRIST_ROW]
+    .map((row) => values[row * 3 + 1])
+    .filter(Number.isFinite)
+    .map((wristY) => (wristY - shoulderY) * scale + TRAINING_SHOULDER_Y);
+}
+
+/** Every visible hand is below where the training videos' frame ended. */
+function handsLowered(values: Float32Array, aspect: number) {
+  const heights = wristHeights(values, aspect);
+  return !!heights && heights.length > 0 && heights.every((height) => height > TRAINING_FRAME_BOTTOM);
+}
+
+/**
+ * Drops frames at the start and end where the hands are lowered (raising
+ * them into position, resting afterwards). Signs made low throughout, such
+ * as "dog", keep all their frames.
+ */
+function trimLoweredEnds(frames: Float32Array[], times: number[], lowered: boolean[]) {
+  let start = 0;
+  let end = frames.length;
+  while (start < end && lowered[start]) start += 1;
+  while (end > start && lowered[end - 1]) end -= 1;
+  if (end - start < Math.max(MIN_HAND_FRAMES, Math.ceil(frames.length * 0.4))) {
+    return { frames, times };
+  }
+  return { frames: frames.slice(start, end), times: times.slice(start, end) };
+}
+
+function confidenceLabel(confidence: number) {
+  // Calibrated on 250 real sign videos: at 70%+ about 84% were right.
+  if (confidence >= 0.7) return "Very likely";
+  if (confidence >= LOW_CONFIDENCE) return "Likely";
+  return "Not sure";
+}
+
 function sleep(ms: number) {
   return new Promise<void>((resolve) => window.setTimeout(resolve, ms));
 }
@@ -239,6 +303,10 @@ interface RecordingSession {
   startedAt: number;
   handFrames: Float32Array[];
   handFrameTimes: number[];
+  handFrameLowered: boolean[];
+  raisedFrames: number;
+  restingSince: number | null;
+  restingWrists: number[] | null;
   frameAspect: number;
   trackedFrames: number;
   trackerFailed: boolean;
@@ -769,10 +837,33 @@ const SignDetection: React.FC<SignDetectionProps> = ({ practiceSigns }) => {
         if (!frame || !session.active) continue;
 
         session.trackedFrames += 1;
+        const lowered = frame.hasHands && handsLowered(frame.values, session.frameAspect);
         if (frame.hasHands) {
           if (session.handFrames.length === 0 && mountedRef.current) setSigningStarted(true);
           session.lastHandAt = startedAt;
+          if (!lowered) session.raisedFrames += 1;
+        }
+        // Lowered and still after signing (hands raised for a while first,
+        // so hands resting in the lap before the sign don't count).
+        const wrists = lowered ? wristHeights(frame.values, session.frameAspect) : null;
+        const moved =
+          !wrists || !session.restingWrists || wrists.length !== session.restingWrists.length
+            ? Infinity
+            : Math.max(...wrists.map((height, index) => Math.abs(height - session.restingWrists![index])));
+        if (!lowered || moved > RESTING_MAX_MOVEMENT) {
+          session.restingSince = lowered ? startedAt : null;
+          session.restingWrists = wrists;
         } else if (
+          session.restingSince !== null &&
+          session.raisedFrames >= AUTO_STOP_MIN_HAND_FRAMES &&
+          startedAt - session.restingSince > AUTO_STOP_RESTING_MS
+        ) {
+          session.autoStopped = true;
+          void finishRecordingRef.current();
+          break;
+        }
+        if (
+          !frame.hasHands &&
           session.handFrames.length >= AUTO_STOP_MIN_HAND_FRAMES &&
           startedAt - session.lastHandAt > AUTO_STOP_HANDS_GONE_MS
         ) {
@@ -791,6 +882,7 @@ const SignDetection: React.FC<SignDetectionProps> = ({ practiceSigns }) => {
         ) {
           session.handFrames.push(frame.values);
           session.handFrameTimes.push(startedAt);
+          session.handFrameLowered.push(lowered);
         }
         if (mountedRef.current) {
           setHandsVisible(frame.hasHands);
@@ -839,7 +931,9 @@ const SignDetection: React.FC<SignDetectionProps> = ({ practiceSigns }) => {
       let response: PredictionResponse;
       let mode: PredictionMode;
 
-      const enoughHandFrames = session.handFrames.length >= MIN_HAND_FRAMES;
+      const trimmed = trimLoweredEnds(session.handFrames, session.handFrameTimes, session.handFrameLowered);
+      const enoughHandFrames = trimmed.frames.length >= MIN_HAND_FRAMES;
+      const practiceTarget = practiceTargetRef.current;
 
       if (trackingUsable && !enoughHandFrames) {
         // Tracking ran at a good rate and barely saw a hand; uploading the
@@ -850,7 +944,10 @@ const SignDetection: React.FC<SignDetectionProps> = ({ practiceSigns }) => {
         mode = "on-device";
         const landmarkHeaders = {
           "Content-Type": "application/octet-stream",
-          "X-Frame-Count": String(session.handFrames.length),
+          "X-Frame-Count": String(trimmed.frames.length),
+          // Practice target, so a local server can save labelled recordings
+          // (only when its SAVE_RECORDINGS_DIR is set).
+          ...(practiceTarget ? { "X-Sign-Index": String(practiceTarget.index) } : {}),
           // Landmarks are fractions of the frame size, so the server
           // needs the frame shape to undo the stretching.
           "X-Frame-Aspect": session.frameAspect.toFixed(4),
@@ -858,7 +955,7 @@ const SignDetection: React.FC<SignDetectionProps> = ({ practiceSigns }) => {
         try {
           response = await requestPrediction(
             "/predict-landmarks",
-            packFrames(session.handFrames, session.handFrameTimes),
+            packFrames(trimmed.frames, trimmed.times),
             {
               signal: session.abort.signal,
               headers: { ...landmarkHeaders, "X-Landmark-Layout": COMPACT_LAYOUT },
@@ -871,7 +968,7 @@ const SignDetection: React.FC<SignDetectionProps> = ({ practiceSigns }) => {
           if (!(error instanceof PredictionError) || error.status !== 400) throw error;
           response = await requestPrediction(
             "/predict-landmarks",
-            packFullFrames(session.handFrames, session.handFrameTimes),
+            packFullFrames(trimmed.frames, trimmed.times),
             { signal: session.abort.signal, headers: landmarkHeaders, onRetry: setRetryNotice }
           );
         }
@@ -898,14 +995,24 @@ const SignDetection: React.FC<SignDetectionProps> = ({ practiceSigns }) => {
       }
       if (!mountedRef.current) return;
 
-      const ranked = (response.predictions || []).map(displayPrediction);
-      if (ranked[0]) response = { ...response, sign: ranked[0].sign };
+      let ranked = (response.predictions || []).map(displayPrediction);
+      const target = practiceTargetRef.current;
+      // Look-alike signs (yes / can, dad / loud) often score close together.
+      // When the user was asked for one of them and it is a near-tie
+      // runner-up, show it first and count it.
+      const nearTie =
+        !!target &&
+        ranked.length > 1 &&
+        ranked[0].sign !== target.name &&
+        ranked[1].sign === target.name &&
+        ranked[1].confidence >= PRACTICE_NEAR_TIE * ranked[0].confidence;
+      if (nearTie) ranked = [ranked[1], ranked[0], ...ranked.slice(2)];
+      if (ranked[0]) response = { ...response, sign: ranked[0].sign, confidence: ranked[0].confidence };
       const alternatives = ranked.filter((prediction) => prediction.sign !== response.sign);
-      setResult({ sign: response.sign, confidence: response.confidence, alternatives, mode });
+      setResult({ sign: response.sign, confidence: response.confidence, alternatives, mode, nearTie });
       setErrorMessage("");
       setPhase("result");
 
-      const target = practiceTargetRef.current;
       const matched = !!target && response.sign === target.name;
       historyIdRef.current += 1;
       const entry: HistoryEntry = {
@@ -993,6 +1100,10 @@ const SignDetection: React.FC<SignDetectionProps> = ({ practiceSigns }) => {
         startedAt: performance.now(),
         handFrames: [],
         handFrameTimes: [],
+        handFrameLowered: [],
+        raisedFrames: 0,
+        restingSince: null,
+        restingWrists: null,
         frameAspect: video.videoWidth / video.videoHeight,
         trackedFrames: 0,
         trackerFailed: false,
@@ -2036,8 +2147,17 @@ const SignDetection: React.FC<SignDetectionProps> = ({ practiceSigns }) => {
                                 </h3>
 
                                 <div className="flex flex-col items-center">
-                                  <p className="text-white/60 text-sm mb-2">
-                                    Confidence Level
+                                  <p
+                                    className={cn(
+                                      "mb-2 rounded-full px-3 py-1 text-sm font-medium",
+                                      result.confidence >= 0.7
+                                        ? "bg-emerald-500/15 text-emerald-200"
+                                        : result.confidence >= LOW_CONFIDENCE
+                                          ? "bg-indigo-500/15 text-indigo-200"
+                                          : "bg-amber-500/15 text-amber-200"
+                                    )}
+                                  >
+                                    {confidenceLabel(result.confidence)}
                                   </p>
                                   <div className="w-full h-3 bg-white/10 rounded-full mt-1 mb-2 overflow-hidden">
                                     <motion.div
@@ -2050,9 +2170,14 @@ const SignDetection: React.FC<SignDetectionProps> = ({ practiceSigns }) => {
                                       }}
                                     ></motion.div>
                                   </div>
-                                  <p className="text-white/90 font-medium px-4 py-1 bg-white/5 rounded-full tabular-nums">
-                                    {confidencePercent.toFixed(1)}%
+                                  <p className="text-xs text-white/50 tabular-nums">
+                                    {Math.round(confidencePercent)}% confidence
                                   </p>
+                                  {result.nearTie && result.alternatives[0] && (
+                                    <p className="mt-2 max-w-xs text-xs text-sky-200/80">
+                                      It also looked a lot like “{formatSign(result.alternatives[0].sign)}”, a similar sign.
+                                    </p>
+                                  )}
                                   {result.confidence < LOW_CONFIDENCE && (
                                     <p className="mt-3 text-xs text-amber-300/90 max-w-xs">
                                       Low confidence. Try again with your hands fully in frame and the sign performed clearly.
@@ -2062,7 +2187,7 @@ const SignDetection: React.FC<SignDetectionProps> = ({ practiceSigns }) => {
 
                                 {result.alternatives.length > 0 && (
                                   <div className="text-sm">
-                                    <p className="text-white/50 mb-2">Other possibilities</p>
+                                    <p className="text-white/50 mb-2">Or maybe</p>
                                     <div className="flex flex-wrap justify-center gap-2">
                                       {result.alternatives.map((alternative) => (
                                         <span

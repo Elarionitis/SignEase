@@ -58,3 +58,6 @@ Ml/ML_Code_ISL/data/train_landmark_files/
 Ml/training/cache/
 Ml/training/runs/
 Ml/training/*.npz
+
+# Local webcam recordings (landmarks) collected with SAVE_RECORDINGS_DIR
+Ml/recordings/

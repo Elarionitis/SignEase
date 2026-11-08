@@ -780,6 +780,37 @@ def get_prediction(frames):
     ], frames_used
 
 
+# Local data collection (off unless set): saves each landmark upload with the
+# sign the user was asked to perform in practice mode (X-Sign-Index), so real
+# webcam recordings can be used to measure and improve the model. Landmarks
+# only, never video. Only enable this on your own machine.
+SAVE_RECORDINGS_DIR = os.environ.get("SAVE_RECORDINGS_DIR", "").strip()
+
+
+def save_recording(frames, timestamps_ms, aspect_ratio, predictions):
+    if not SAVE_RECORDINGS_DIR:
+        return
+    try:
+        index = int(request.headers.get("X-Sign-Index", ""))
+    except ValueError:
+        return
+    if index not in ORD2SIGN:
+        return
+    label = ORD2SIGN[index]
+    folder = os.path.join(SAVE_RECORDINGS_DIR, f"{index}-{label}")
+    os.makedirs(folder, exist_ok=True)
+    np.savez_compressed(
+        os.path.join(folder, f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid4().hex[:6]}.npz"),
+        frames=frames[:, COMPACT_ROWS],
+        rows=COMPACT_ROWS,
+        timestamps=timestamps_ms if timestamps_ms is not None else np.array([]),
+        aspect=np.float32(aspect_ratio),
+        label=label,
+        index=np.int32(index),
+        predicted=json.dumps(predictions),
+    )
+
+
 def prediction_response(frames, timestamps_ms, aspect_ratio, timing, started_at):
     received = len(frames)
     if int(hand_frame_mask(frames).sum()) < MIN_HAND_FRAMES:
@@ -797,6 +828,10 @@ def prediction_response(frames, timestamps_ms, aspect_ratio, timing, started_at)
         return jsonify({"error": "The model could not score this recording. Please try again."}), 500
 
     count("predictions")
+    try:
+        save_recording(frames, timestamps_ms, aspect_ratio, predictions)
+    except Exception:
+        app.logger.exception("Could not save the recording")
     timing["model_prediction_seconds"] = round(finished_at - inference_started_at, 3)
     timing["total_seconds"] = round(finished_at - started_at, 3)
     app.logger.info(
