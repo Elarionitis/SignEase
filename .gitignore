@@ -67,3 +67,6 @@ Ml/candidate_models/
 
 # ASL Citizen landmarks (research licence: never commit or publish)
 Ml/training/asl_citizen/
+
+# Colab notebook for preparing ASL Citizen (kept local)
+Ml/training/colab/
