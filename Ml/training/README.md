@@ -69,7 +69,93 @@ cross-validated ECE 0.07). For the old model the same procedure gives 0.76,
 matching the previous value. With 0.89, predictions shown at >= 90% were
 right 96% of the time on the dictionary videos.
 
-## Current models: a blend of three
+## Current models: trained on real webcam signers (ASL Citizen)
+
+The shipped models are the blend described below, fine-tuned further on
+[ASL Citizen](https://www.microsoft.com/en-us/research/project/asl-citizen/)
+(Microsoft Research): 83,399 webcam recordings by 51 Deaf and hard of
+hearing signers, split by signer into train, val and test. Its licence is
+non-commercial research use only, so SignEase is a free, non-commercial
+project. The videos and landmarks are never committed (`asl_citizen/` and
+`colab/` are git-ignored).
+
+**Data.** 8,925 ASL Citizen videos cover 235 of SignEase's 250 signs (by
+name, or by another name for the same sign, e.g. FATHER for `dad`). 26
+glosses are left out because they are a different sign from SignEase's
+(`EXCLUDED_GLOSSES` in `asl_citizen.py`, chosen on train and val only). 15
+signs have no ASL Citizen videos: feet, goose, jeans, mitten, nap, pajamas,
+police, pool, puppy, puzzle, say, shhh, sleepy, snack, wake.
+
+| Split | Clips | Signers | Signs |
+| --- | --- | --- | --- |
+| train | 3,880 | 35 | 230 |
+| val (picks epochs and the temperature) | 1,002 | 5 | 230 |
+| test (scored once, at the end) | 3,247 | 11 | 230 |
+
+**Training.** Every clip goes through the backend's own webcam conversion,
+is cropped to its signing span, and repeated 5 times next to the Kaggle
+cache (17% of the clips; each copy is augmented differently). The three
+models of the previous blend continue from their weights, and the
+checkpoint is chosen on the val signers (`--monitor-cache`).
+
+**Results**, through the full backend pipeline (segment search and hand
+variants included), same three-model blend structure:
+
+| Test set | Previous blend | New blend |
+| --- | --- | --- |
+| ASL Citizen test signers (3,247 clips, unseen), top-1 | 74.2% | **87.4%** |
+| ASL Citizen test signers, top-3 | 86.8% | **95.8%** |
+| ASL Citizen val signers (1,002 clips), top-1 / top-3 | 78.1% / 88.7% | **90.0% / 97.0%** |
+| Dictionary videos (250), top-1 / top-3 | 60.8% / 73.6% | **64.0%** / 73.6% |
+| Kaggle held-out signers, webcam simulation, top-1 | **92.0%** | 91.1% |
+| Kaggle held-out signers, clean clips, top-1 | 97.6% | 97.4% |
+
+On the test signers the new blend fixed 454 predictions and broke 24 (sign
+test p < 1e-100); `yes` went from 7 to 9 of 10, `can` from 11 to 12 of
+12, `dad` from 10 to 12 of 12. Each new model alone also beats the previous
+blend (86.3-86.6% top-1). Adding the hand-size models (`--hand-size`) did
+not help (85.7%). The small drop on the Kaggle webcam simulation (35 fixed,
+60 broken) is on phone recordings with simulated webcam effects, not on
+real webcams.
+
+**Confidence**: `CONFIDENCE_TEMPERATURE = 0.69`, fitted on the val signers
+(bootstrap 90% interval 0.67-0.71, 10-fold cross-validated ECE 0.03). The
+test signers alone pick the same value (ECE 0.027, against 0.077 with the
+previous 0.86). Predictions shown at >= 90% were right 96% of the time on
+the test signers, and 75% of recordings reach it.
+
+Memory and latency are unchanged (same architecture and file sizes).
+
+```bash
+# Landmarks: extract_asl_citizen.py on a zip of the videos writes chunk_*.npz.
+# asl_citizen/manifest.csv lists one row per video: video, gloss, participant,
+# split, member (path in the zip), signease_sign, priority (0 = extract), order
+python extract_asl_citizen.py SignEase_ASL_Citizen_subset.zip asl_citizen ours 400 640
+python asl_citizen.py --data asl_citizen --out asl_citizen/cache_train --splits train
+python asl_citizen.py --data asl_citizen --out asl_citizen/cache_val --splits val
+python asl_citizen.py --merge cache asl_citizen/cache_train --repeat 5 --out asl_citizen/cache_mix
+
+C="--cache asl_citizen/cache_mix --monitor-cache asl_citizen/cache_val --init original.tflite"
+python finetune.py $C --two-hand --resume runs/d/epoch8.npz --epochs 5 --learning-rate 5e-5 --seed 4 --out runs/asl_d
+python finetune.py $C --two-hand --resume runs/e/epoch10.npz --epochs 5 --learning-rate 5e-5 --seed 5 --out runs/asl_e
+python finetune.py $C --epochs 8 --seed 6 --out runs/asl_one
+# export each best.npz with TensorFlow 2.14 (see below), then:
+python eval_asl_citizen.py --data asl_citizen --splits val test \
+    --model d=runs/asl_d/final.tflite e=runs/asl_e/final.tflite one=runs/asl_one/final.tflite --out asl_scores.npz
+```
+
+If you use this work, please cite ASL Citizen:
+
+```bibtex
+@article{desai2023asl,
+  title={ASL Citizen: A Community-Sourced Dataset for Advancing Isolated Sign Language Recognition},
+  author={Desai, Aashaka and Berger, Lauren and Minakov, Fyodor O and Milan, Vanessa and Singh, Chinmay and Pumphrey, Kriston and Ladner, Richard E and Daum{\'e} III, Hal and Lu, Alex X and Caselli, Naomi and Bragg, Danielle},
+  journal={arXiv preprint arXiv:2304.05934},
+  year={2023}
+}
+```
+
+## Before ASL Citizen: a blend of three trained on Kaggle
 
 The backend averages three models with equal weight (`MODEL_BLEND`): two
 two-hand models (`asl_model.tflite`, `asl_model_two_hand_b.tflite`) and the

@@ -165,11 +165,12 @@ DEFAULT_CAMERA_ASPECT_RATIO = 4 / 3
 
 # The model is underconfident (it was trained with 0.25 label smoothing), so
 # confidence is temperature-scaled to match how often predictions are right
-# on real sign videos; it never changes the ranking. Fitted for the current
-# blend on the 250 dictionary videos (10-fold cross-validated calibration
-# error 0.06, bootstrap 90% interval 0.82-0.90). Refit it with
+# on real webcam recordings; it never changes the ranking. Fitted for the
+# current blend on the ASL Citizen validation signers (1,002 webcam clips,
+# 10-fold cross-validated calibration error 0.03, bootstrap 90% interval
+# 0.67-0.71); the unseen test signers pick the same value. Refit it with
 # training/calibrate.py whenever the model changes.
-CONFIDENCE_TEMPERATURE = env_float("CONFIDENCE_TEMPERATURE", 0.86, 0.1, 1.0)
+CONFIDENCE_TEMPERATURE = env_float("CONFIDENCE_TEMPERATURE", 0.69, 0.1, 1.0)
 
 # Landmark uploads: ~30 fps for the 10 second maximum recording, with headroom.
 MAX_LANDMARK_FRAMES = env_int("MAX_LANDMARK_FRAMES", 600)

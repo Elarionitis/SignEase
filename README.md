@@ -11,7 +11,7 @@ Predictions blend three models. Two of them read both hands and move and scale e
 
 - **Frame shape.** The training videos are portrait phone recordings (about 3:4), and MediaPipe coordinates are fractions of the frame's width and height. The browser sends the camera's aspect ratio and the backend re-expresses the landmarks as a 3:4 frame. Without this, a 4:3 webcam squeezes every hand shape to about half its width.
 - **Choosing the signing hand.** Each model mainly follows one hand, and in two-handed signs or with a resting hand in view it can follow the wrong one, so when both hands are tracked the backend also scores each hand on its own and keeps the most confident result. On the original 120 dictionary videos this fixed 6 predictions and broke none (two-handed signs 33% → 48% correct, all signs 57% → 62%), and the same held on the 127 videos added later, which it was not tuned on (46% → 50%, 6 fixed, none broken).
-- **Calibrated confidence.** The model was trained with smoothed labels, so its raw scores rarely pass about 75% even when it is right. The backend applies temperature scaling (fitted on the 120 dictionary videos) so the confidence shown matches how often predictions are actually correct.
+- **Calibrated confidence.** The model was trained with smoothed labels, so its raw scores rarely pass about 75% even when it is right. The backend applies temperature scaling (fitted on real webcam recordings of signers the models never saw) so the confidence shown matches how often predictions are actually correct: predictions shown at 90% or more are right 96% of the time.
 3. If the device cannot run hand tracking fast enough (no WebGL2, very slow GPU), the page falls back to uploading the recorded clip to `POST /predict`, and the server extracts landmarks itself. This is slower on a shared CPU.
 
 Running MediaPipe on the server was the bottleneck in production: a free/starter Render CPU had to sample only a few frames to avoid timeouts, and the model's confidence dropped sharply with those sparse sequences (for example 74% vs 30% on a Kaggle sample). Tracking in the browser gives the model the full frame rate, as when running locally, at no server cost.
@@ -70,7 +70,7 @@ Optional backend environment variables:
 | --- | --- | --- |
 | `CORS_ORIGINS` | `*` | Comma-separated allowed origins, e.g. `https://your-app.vercel.app` |
 | `MAX_LANDMARK_FRAMES` | `600` | Longest landmark sequence accepted |
-| `CONFIDENCE_TEMPERATURE` | `0.86` | Confidence calibration (lower = sharper); `1` shows raw model scores |
+| `CONFIDENCE_TEMPERATURE` | `0.69` | Confidence calibration (lower = sharper); `1` shows raw model scores |
 | `INFERENCE_PASSES` | `1` | Model runs averaged for the chosen segment (only useful for models exported before the fine-tuned one, which dropped frames at random) |
 | `FRAME_SAMPLE_RATE` / `MAX_SAMPLED_FRAMES` | `2` / `48` | Video fallback: frame stride and cap |
 | `MAX_UPLOAD_MB` | `8` | Request size limit |
@@ -101,14 +101,15 @@ Render's free instances sleep after 15 minutes without traffic, and the first pr
 
 ## ML Model Notes
 
-The ML code is based on isolated ASL recognition using the Google ASL Signs dataset and a custom GISLR dataset:
+The ML code is based on isolated ASL recognition using the Google ASL Signs dataset and a custom GISLR dataset, and the models are fine-tuned on real webcam recordings from ASL Citizen:
 
 - Google ASL Signs: `https://www.kaggle.com/competitions/asl-signs/data`
 - GISLR public dataset: `https://www.kaggle.com/datasets/markwijkhuizen/gislr-dataset-public`
+- ASL Citizen (Microsoft Research): `https://www.microsoft.com/en-us/research/project/asl-citizen/` (Desai et al., 2023, arXiv:2304.05934). Its licence allows non-commercial research use only, so SignEase is a free, non-commercial project; the videos and landmarks are not included in this repository.
 
 The model recognizes common ASL concepts such as `hello`, `thankyou`, `mom`, `dad`, `water`, `food`, `book`, `yes`, `no`, `please`, and many more from the 250-sign dataset.
 
-The backend blends three models rebuilt from the original Kaggle-notebook transformer: two read both hands and normalise the signer's position, and one is the earlier fine-tuned one-hand model. On the 250 dictionary videos, which no model was trained on, the blend gets 61% top-1 and 74% top-3 through the backend pipeline. See `Ml/training/README.md` for how they were verified, trained, evaluated and calibrated, and how to reproduce them.
+The backend blends three models rebuilt from the original Kaggle-notebook transformer: two read both hands and normalise the signer's position, and one is the earlier fine-tuned one-hand model. All three are then fine-tuned on ASL Citizen webcam signers. On 3,247 webcam recordings by 11 signers the models never saw, the blend gets 87% top-1 and 96% top-3 through the backend pipeline (74% and 87% before ASL Citizen); on the 250 dictionary videos it gets 64% top-1 and 74% top-3. See `Ml/training/README.md` for how they were verified, trained, evaluated and calibrated, and how to reproduce them.
 
 ## Development Notes
 

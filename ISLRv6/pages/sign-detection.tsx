@@ -79,8 +79,8 @@ const MIN_HAND_FRAMES = 4;
 // Below this tracking rate (slow GPU / software rendering) the on-device
 // sequence is too sparse, so the recorded clip is sent to the server instead.
 const MIN_TRACKED_FPS = 6;
-// Confidence is calibrated on the server: below this, about half of the
-// predictions on real sign videos were wrong.
+// Confidence is calibrated on the server: below this, about two thirds of the
+// predictions on real webcam recordings were wrong.
 const LOW_CONFIDENCE = 0.4;
 const VIDEO_CONSTRAINTS: MediaTrackConstraints = {
   width: { ideal: 640 },
@@ -286,7 +286,7 @@ function trimLoweredEnds(frames: Float32Array[], times: number[], lowered: boole
 }
 
 function confidenceLabel(confidence: number) {
-  // Calibrated on 250 real sign videos: at 70%+ about 84% were right.
+  // Calibrated on webcam recordings of unseen signers: at 70%+ about 93% were right.
   if (confidence >= 0.7) return "Very likely";
   if (confidence >= LOW_CONFIDENCE) return "Likely";
   return "Not sure";
