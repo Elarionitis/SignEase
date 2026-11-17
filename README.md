@@ -95,7 +95,7 @@ The backend is built to stay responsive when many people try the demo at once:
 
 ## Keeping the backend awake
 
-Render's free instances sleep after 15 minutes without traffic, and the first prediction after that waits up to a minute. The detection page shows when the server is waking up and pings it while the page is open. To keep it awake all the time, set the repository variable `BACKEND_URL` (Settings → Secrets and variables → Actions → Variables) to the backend URL; the `Keep backend awake` workflow then pings it every 10 minutes.
+Render's free instances sleep after 15 minutes without traffic, and the first prediction after that waits up to a minute. The detection page shows when the server is waking up and pings it while the page is open. To keep it awake all the time, set the repository variable `BACKEND_URL` (Settings → Secrets and variables → Actions → Variables) to the backend URL; the `Keep backend awake` workflow then pings it every 10 minutes, around the clock. Each run keeps pinging for almost 6 hours and the next queued run takes over, because GitHub delays frequent schedules. You can start it right away from the Actions tab (Keep backend awake → Run workflow).
 
 ## ML Model Notes
 
