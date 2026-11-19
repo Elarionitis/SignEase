@@ -32,18 +32,50 @@ jobs:
           BACKEND_URL: ${{ vars.BACKEND_URL }}
           RUN_MINUTES: "345"
           INTERVAL_SECONDS: "600"
+          MAX_FAILURES_IN_A_ROW: "3"
         run: |
           if [ -z "$BACKEND_URL" ]; then
             echo "::error::Set the BACKEND_URL repository variable to the Render backend URL."
             exit 1
           fi
-          url="${BACKEND_URL%/}/warmup"
+          base="${BACKEND_URL%/}"
+          case "$base" in
+            http://*|https://*) ;;
+            *) base="https://$base" ;;
+          esac
+          echo "Pinging ${base}/warmup"
+
+          # One ping: up to 3 minutes, enough for Render to wake a sleeping
+          # instance. Prints the HTTP status, or why there was no answer.
+          ping_once() {
+            local code
+            code=$(curl --silent --show-error --location --output /tmp/body \
+              --write-out "%{http_code}" --connect-timeout 30 --max-time 180 \
+              "${base}/warmup") || { echo "no response ($code)"; return 1; }
+            if [ "$code" = "200" ]; then
+              echo "$(date -u +%H:%M) backend awake"
+              return 0
+            fi
+            echo "$(date -u +%H:%M) HTTP $code: $(head -c 300 /tmp/body)"
+            return 1
+          }
+
+          failures=0
           end=$((SECONDS + RUN_MINUTES * 60))
           while true; do
-            if curl --fail --silent --show-error --max-time 120 --retry 2 --retry-delay 15 "$url" > /dev/null; then
-              echo "$(date -u +%H:%M) backend awake"
+            if ping_once; then
+              failures=0
             else
-              echo "::warning::$(date -u +%H:%M) ping failed; retrying in 10 minutes"
+              failures=$((failures + 1))
+              echo "::warning::Ping failed ($failures in a row)"
+              if [ "$failures" -ge "$MAX_FAILURES_IN_A_ROW" ]; then
+                echo "::error::${base} did not answer ${failures} times in a row. Check the Render"
+                echo "::error::service: it should be Live (not Suspended or Failed), its URL should"
+                echo "::error::match BACKEND_URL, and its Logs should show the server starting."
+                exit 1
+              fi
+              sleep 60
+              continue
             fi
             [ "$SECONDS" -ge "$end" ] && break
             sleep "$INTERVAL_SECONDS"
