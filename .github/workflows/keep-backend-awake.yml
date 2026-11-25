@@ -11,8 +11,11 @@
 name: Keep backend awake
 
 on:
-  schedule:
-    - cron: "7 * * * *"
+  # The hourly schedule is paused while the Render service does not answer
+  # (every ping timed out). Once https://<backend>/health works in a browser,
+  # remove the "#" from the two schedule lines below to turn it back on.
+  # schedule:
+  #   - cron: "7 * * * *"
   workflow_dispatch:
 
 concurrency:
